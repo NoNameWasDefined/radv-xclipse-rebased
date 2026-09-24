@@ -37,6 +37,13 @@ struct radv_amdgpu_winsys_bo {
    void *cpu_map;
 
    bool emulate_sparse_residency;
+
+   /* The alignment this BO was created with (the IB reuse cache matches on it at destroy). */
+   unsigned xclipse_alignment;
+
+   /* Counted by radv_xclipse_bo_churn() at create? Read back at destroy, so imports (never counted)
+    * are not subtracted. */
+   bool churn_counted;
 };
 
 static inline struct radv_amdgpu_winsys_bo *
@@ -46,5 +53,9 @@ radv_amdgpu_winsys_bo(struct radeon_winsys_bo *bo)
 }
 
 void radv_amdgpu_bo_init_functions(struct radv_amdgpu_winsys *ws);
+
+/* The process-wide IB cache must not outlive the winsys that parked into it. */
+void radv_xclipse_ibcache_winsys_begin_destroy(struct radv_amdgpu_winsys *ws);
+void radv_xclipse_ibcache_winsys_end_destroy(struct radv_amdgpu_winsys *ws);
 
 #endif /* RADV_AMDGPU_BO_H */

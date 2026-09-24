@@ -165,11 +165,21 @@ radv_amdgpu_winsys_destroy(struct radeon_winsys *rws)
 {
    struct radv_amdgpu_winsys *ws = (struct radv_amdgpu_winsys *)rws;
 
+   /* Nothing freed below may park in the IB cache, and what this winsys parked goes now
+    * (radv_xclipse_ibcache_purge_ws()). */
+   radv_xclipse_ibcache_winsys_begin_destroy(ws);
+
    if (ws->info.compiler_info.has_smem_with_null_prt_bug) {
       simple_mtx_destroy(&ws->null_prt_bug.lock);
       if (ws->null_prt_bug.bo)
          ws->base.buffer_destroy(&ws->base, ws->null_prt_bug.bo);
    }
+
+   /* Release IB BOs still parked in the cache. */
+   for (uint32_t i = 0; i < ws->ib_cache.count; i++)
+      ws->base.buffer_destroy(&ws->base, ws->ib_cache.entries[i].bo);
+   ws->ib_cache.count = 0;
+   simple_mtx_destroy(&ws->ib_cache.lock);
 
    u_rwlock_destroy(&ws->global_bo_list.lock);
    free(ws->global_bo_list.bos);
@@ -181,6 +191,8 @@ radv_amdgpu_winsys_destroy(struct radeon_winsys *rws)
       fclose(ws->bo_history_logfile);
 
    u_rwlock_destroy(&ws->log_bo_list_lock);
+
+   radv_xclipse_ibcache_winsys_end_destroy(ws);
 
    radv_amdgpu_alloc_tracker_release(ws->alloc_tracker);
 
@@ -286,6 +298,9 @@ radv_amdgpu_winsys_create(int fd, const struct radeon_info *info, const BITSET_W
 
    if (ws->info.compiler_info.has_smem_with_null_prt_bug)
       simple_mtx_init(&ws->null_prt_bug.lock, mtx_plain);
+
+   /* Command-buffer IB cache (see radv_amdgpu_winsys.h). */
+   simple_mtx_init(&ws->ib_cache.lock, mtx_plain);
 
    *winsys = &ws->base;
 
