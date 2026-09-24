@@ -65,7 +65,7 @@ radv_make_texel_buffer_descriptor(struct radv_device *device, uint64_t va, VkFor
       .has_desc_resource_level = pdev->info.compiler_info.has_desc_resource_level,
    };
 
-   ac_build_buffer_descriptor(pdev->info.gfx_level, &ac_state, state);
+   ac_build_buffer_descriptor(pdev->info.desc_gfx_level, &ac_state, state);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL

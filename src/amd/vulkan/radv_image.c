@@ -22,6 +22,7 @@
 #include "radv_entrypoints.h"
 #include "radv_formats.h"
 #include "radv_image_view.h"
+#include "radv_logcat.h"
 #include "radv_radeon_winsys.h"
 #include "radv_video.h"
 #include "radv_wsi.h"
@@ -276,8 +277,9 @@ radv_use_dcc_for_image_early(struct radv_device *device, struct radv_image *imag
    if (pdev->drirc.debug.disable_dcc_stores && (image->vk.usage & VK_IMAGE_USAGE_2_STORAGE_BIT_KHR))
       return false;
 
-   /* DCC MSAA can't work on GFX10.3 and earlier without FMASK. */
-   if (image->vk.samples > 1 && pdev->info.gfx_level < GFX11 && (RADV_DEBUG(instance, NO_FMASK)))
+   /* DCC MSAA can't work on GFX10.3 and earlier without FMASK. (Xclipse 920 disables FMASK, and its
+    * CB hangs on GFX10.3-style MSAA DCC anyway.) */
+   if (image->vk.samples > 1 && pdev->info.gfx_level < GFX11 && !pdev->use_fmask)
       return false;
 
    return radv_are_formats_dcc_compatible(pdev, pCreateInfo->pNext, format, image->vk.create_flags, sign_reinterpret);
@@ -550,6 +552,8 @@ radv_image_get_plane_format(const struct radv_physical_device *pdev, const struc
          return image->vk.format;
       if (radv_format_description(image->vk.format)->layout == UTIL_FORMAT_LAYOUT_ASTC)
          return vk_texcompress_astc_emulation_format(image->vk.format);
+      else if (radv_bc_emulation_format(image->vk.format) != VK_FORMAT_UNDEFINED)
+         return radv_bc_emulation_format(image->vk.format);
       else
          return vk_texcompress_etc2_emulation_format(image->vk.format);
    }
@@ -759,6 +763,10 @@ radv_image_bo_set_metadata(struct radv_device *device, struct radv_image *image,
       md.u.gfx12.dcc_data_format = surface->u.gfx9.dcc_data_format;
       md.u.gfx12.dcc_write_compress_disable = surface->u.gfx9.dcc_write_compress_disable;
       md.u.gfx12.scanout = (surface->flags & RADEON_SURF_SCANOUT) != 0;
+      RADV_LOGI("[IMG_META] GFX12 swizzle=%u dcc_blk=%u dcc_num=%u dcc_fmt=%u dcc_wcd=%u scanout=%u",
+                md.u.gfx12.swizzle_mode, md.u.gfx12.dcc_max_compressed_block,
+                md.u.gfx12.dcc_number_type, md.u.gfx12.dcc_data_format,
+                md.u.gfx12.dcc_write_compress_disable, md.u.gfx12.scanout);
    } else if (pdev->info.gfx_level >= GFX9) {
       const uint64_t dcc_offset = surface->display_dcc_offset ? surface->display_dcc_offset : surface->meta_offset;
       md.u.gfx9.swizzle_mode = surface->u.gfx9.swizzle_mode;
@@ -768,6 +776,11 @@ radv_image_bo_set_metadata(struct radv_device *device, struct radv_image *image,
       md.u.gfx9.dcc_independent_128b_blocks = surface->u.gfx9.color.dcc.independent_128B_blocks;
       md.u.gfx9.dcc_max_compressed_block_size = surface->u.gfx9.color.dcc.max_compressed_block_size;
       md.u.gfx9.scanout = (surface->flags & RADEON_SURF_SCANOUT) != 0;
+      RADV_LOGI("[IMG_META] GFX9 swizzle=%u dcc_off256=%llu dcc_pitch=%u dcc_64b=%u dcc_128b=%u dcc_blk=%u scanout=%u",
+                md.u.gfx9.swizzle_mode, (unsigned long long)md.u.gfx9.dcc_offset_256b,
+                md.u.gfx9.dcc_pitch_max, md.u.gfx9.dcc_independent_64b_blocks,
+                md.u.gfx9.dcc_independent_128b_blocks, md.u.gfx9.dcc_max_compressed_block_size,
+                md.u.gfx9.scanout);
    } else {
       md.u.legacy.microtile =
          surface->u.legacy.level[0].mode >= RADEON_SURF_MODE_1D ? RADEON_LAYOUT_TILED : RADEON_LAYOUT_LINEAR;
@@ -782,6 +795,12 @@ radv_image_bo_set_metadata(struct radv_device *device, struct radv_image *image,
       md.u.legacy.stride = surface->u.legacy.level[0].nblk_x * surface->bpe;
       md.u.legacy.scanout = (surface->flags & RADEON_SURF_SCANOUT) != 0;
    }
+
+   RADV_LOGI("[IMG_META] surf_size=%llu surf_align=%llu flags=0x%llx blk_w=%u blk_h=%u",
+             (unsigned long long)surface->surf_size,
+             (unsigned long long)(1ULL << surface->alignment_log2),
+             (unsigned long long)surface->flags,
+             surface->blk_w, surface->blk_h);
 
    radv_make_texture_descriptor(device, image, false, (VkImageViewType)image->vk.image_type, plane_format,
                                 &fixedmapping, 0, image->vk.mip_levels - 1, 0, image->vk.array_layers - 1, plane_width,
@@ -800,6 +819,13 @@ static void
 radv_image_alloc_single_sample_cmask(const struct radv_device *device, const struct radv_image *image,
                                      struct radeon_surf *surf)
 {
+   const struct radv_physical_device *pdev = radv_device_physical(device);
+
+   /* Xclipse 920: no CMASK fast clears. The CB/TU follow GFX11 conventions (no CMASK), so
+    * fast-cleared targets sample black and drop colour writes. */
+   if (pdev->info.gfx11_shader_core)
+      return;
+
    if (!surf->cmask_size || surf->cmask_offset || surf->bpe > 8 || image->vk.mip_levels > 1 ||
        image->vk.extent.depth > 1 || radv_image_has_dcc(image) || !radv_image_use_fast_clear_for_image_early(image) ||
        !image->exclusive || (image->vk.create_flags & VK_IMAGE_CREATE_2_SPARSE_BINDING_BIT_KHR) ||
@@ -1142,6 +1168,13 @@ radv_image_create_layout(struct radv_device *device, struct radv_image_create_in
 {
    struct radv_physical_device *pdev = radv_device_physical(device);
 
+   /* Log image create layout entry. */
+   RADV_LOGI("[IMG_LAYOUT_IN] fmt=%d %ux%u tiling=%d usage=0x%x",
+             (int)image->vk.format,
+             image->vk.extent.width, image->vk.extent.height,
+             (int)image->vk.tiling,
+             image->vk.usage);
+
    /* Clear the pCreateInfo pointer so we catch issues in the delayed case when we test in the
     * common internal case. */
    create_info.vk_info = NULL;
@@ -1234,8 +1267,11 @@ radv_image_create_layout(struct radv_device *device, struct radv_image_create_in
 
       if (mod_info) {
          if (mod_info->pPlaneLayouts[plane].rowPitch % image->planes[plane].surface.bpe ||
-             !mod_info->pPlaneLayouts[plane].rowPitch)
+             !mod_info->pPlaneLayouts[plane].rowPitch) {
+            mesa_logi("[ANB-FAIL] rowPitch=%" PRIu64 " not a multiple of bpe=%u (or zero)",
+                      mod_info->pPlaneLayouts[plane].rowPitch, image->planes[plane].surface.bpe);
             return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
+         }
 
          offset = mod_info->pPlaneLayouts[plane].offset;
          stride = mod_info->pPlaneLayouts[plane].rowPitch / image->planes[plane].surface.bpe;
@@ -1245,14 +1281,20 @@ radv_image_create_layout(struct radv_device *device, struct radv_image_create_in
       }
 
       if (!ac_surface_override_offset_stride(&pdev->info, &image->planes[plane].surface, image->vk.array_layers,
-                                             image->vk.mip_levels, offset, stride))
+                                             image->vk.mip_levels, offset, stride)) {
+         mesa_logi("[ANB-FAIL] ac_surface_override_offset_stride rejected offset=%" PRIu64 " stride=%u bpe=%u",
+                   offset, stride, image->planes[plane].surface.bpe);
          return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
+      }
 
       /* Validate DCC offsets in modifier layout. */
       if (plane_count == 1 && mod_info) {
          unsigned mem_planes = ac_surface_get_nplanes(&image->planes[plane].surface);
-         if (mod_info->drmFormatModifierPlaneCount != mem_planes)
+         if (mod_info->drmFormatModifierPlaneCount != mem_planes) {
+            mesa_logi("[ANB-FAIL] plane count mismatch: modifier says %u, surface has %u",
+                      mod_info->drmFormatModifierPlaneCount, mem_planes);
             return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
+         }
 
          for (unsigned i = 1; i < mem_planes; ++i) {
             if (ac_surface_get_plane_offset(pdev->info.gfx_level, &image->planes[plane].surface, i, 0) !=
@@ -1281,6 +1323,25 @@ radv_image_create_layout(struct radv_device *device, struct radv_image_create_in
           ac_modifier_has_dcc(image->planes[0].surface.modifier) ==
              (pdev->info.gfx_level >= GFX12 ? image->planes[0].surface.u.gfx9.gfx12_enable_dcc
                                             : radv_image_has_dcc(image)));
+
+   /* Log image layout. */
+   {
+      const struct radeon_surf *s0 = &image->planes[0].surface;
+      RADV_LOGI("[IMG_LAYOUT] %ux%u fmt=%d tiling=%d size=%llu align=%u swizzle=%u",
+                image->vk.extent.width, image->vk.extent.height,
+                (int)image->vk.format,
+                (int)image->vk.tiling,
+                (unsigned long long)image->size,
+                image->alignment,
+                s0->u.gfx9.swizzle_mode);
+      RADV_LOGI("[IMG_LAYOUT] surf_size=%llu total_size=%llu bpe=%u nplanes=%u is_linear=%u",
+                (unsigned long long)s0->surf_size,
+                (unsigned long long)s0->total_size,
+                s0->bpe,
+                image->plane_count,
+                s0->is_linear);
+   }
+
    return VK_SUCCESS;
 }
 
@@ -1804,8 +1865,13 @@ radv_bind_image_memory(struct radv_device *device, struct radv_image *image, uin
    image->bindings[bind_idx].addr = addr + offset;
    image->bindings[bind_idx].range = range;
 
-   if (image->vk.usage & VK_IMAGE_USAGE_2_HOST_TRANSFER_BIT_KHR)
-      image->bindings[bind_idx].host_ptr = (uint8_t *)radv_buffer_map(device->ws, bo) + offset;
+   /* On GTT-only devices all BOs are in system RAM: always set host_ptr for CPU-side paths.
+    */
+   if (image->vk.usage & VK_IMAGE_USAGE_2_HOST_TRANSFER_BIT_KHR || pdev->info.vram_size_kb == 0) {
+      void *map = radv_buffer_map(device->ws, bo);
+      if (map)
+         image->bindings[bind_idx].host_ptr = (uint8_t *)map + offset;
+   }
 
    radv_rmv_log_image_bind(device, bind_idx, radv_image_to_handle(image));
 
@@ -1890,6 +1956,33 @@ radv_BindImageMemory2(VkDevice _device, uint32_t bindInfoCount, const VkBindImag
       const uint64_t addr = radv_buffer_get_va(mem->bo);
 
       radv_bind_image_memory(device, image, bind_idx, mem->bo, addr, offset, reqs.memoryRequirements.size);
+
+      /* Force buffer_set_metadata for image BOs on GFX10.3 (normally GFX12 only, for DCC): the
+       * texture unit needs the tiling/swizzle info for image_store/image_load addressing.
+       */
+      {
+         const struct radv_physical_device *pdev = radv_device_physical(device);
+         /* Never stamp tiling/DCC metadata on a LINEAR image BO: the Samsung DPU reads tiling_flags
+          * from gralloc, fetches a scanout buffer as tiled, and the phone resets (Winlator first
+          * present). Linear images need no metadata for the texture unit. */
+         bool skip_linear_meta = image->planes[0].surface.is_linear;
+         if (skip_linear_meta) {
+            RADV_LOGI("[BIND_IMG_META] SKIP linear scanout image (no DPU-hostile tiling meta): "
+                      "va=0x%llx wxh=%ux%u fmt=%u usage=0x%x",
+                      (unsigned long long)image->bindings[0].addr, image->vk.extent.width,
+                      image->vk.extent.height, (uint32_t)image->vk.format, (uint32_t)image->vk.usage);
+         }
+         if (pdev->info.gfx_level >= GFX9 && pdev->info.gfx_level < GFX12 && bind_idx == 0 &&
+             !skip_linear_meta) {
+            radv_image_bo_set_metadata(device, image, mem->bo);
+            RADV_LOGI("[BIND_IMG_META] Force-set image metadata for GFX10.3: swizzle=%u size=%llu "
+                      "va=0x%llx wxh=%ux%u fmt=%u usage=0x%x mips=%u",
+                      image->planes[0].surface.u.gfx9.swizzle_mode,
+                      (unsigned long long)image->planes[0].surface.surf_size,
+                      (unsigned long long)image->bindings[0].addr, image->vk.extent.width, image->vk.extent.height,
+                      (uint32_t)image->vk.format, (uint32_t)image->vk.usage, image->vk.mip_levels);
+         }
+      }
    }
    return VK_SUCCESS;
 }

@@ -401,6 +401,8 @@ radv_device_finish_meta(struct radv_device *device)
    vk_common_DestroyPipelineCache(radv_device_to_handle(device), device->meta_state.cache, NULL);
    mtx_destroy(&device->meta_state.mtx);
 
+   radv_device_finish_meta_xclipse_bc(device);
+
    if (device->meta_state.device.cache)
       vk_meta_device_finish(&device->vk, &device->meta_state.device);
 }

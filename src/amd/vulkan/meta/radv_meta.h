@@ -93,6 +93,7 @@ enum radv_meta_object_key_type {
    RADV_META_OBJECT_KEY_BLIT2D_DEPTH_STENCIL,
    RADV_META_OBJECT_KEY_FILL_OR_COPY_MEMORY,
    RADV_META_OBJECT_KEY_COPY_IMAGE_TO_BUFFER,
+   RADV_META_OBJECT_KEY_BC_DECODE,
    RADV_META_OBJECT_KEY_COPY_BUFFER_TO_IMAGE,
    RADV_META_OBJECT_KEY_COPY_IMAGE,
    RADV_META_OBJECT_KEY_COPY_MEMORY_INDIRECT_PREPROCESS_CS,
@@ -151,6 +152,7 @@ enum radv_meta_htile_preserve_flags {
 
 VkResult radv_device_init_meta(struct radv_device *device);
 void radv_device_finish_meta(struct radv_device *device);
+void radv_device_finish_meta_xclipse_bc(struct radv_device *device);
 
 void radv_device_init_accel_struct_build_state(struct radv_device *device);
 
@@ -389,6 +391,11 @@ void radv_update_memory_cp(struct radv_cmd_buffer *cmd_buffer, uint64_t va, cons
 
 void radv_update_memory(struct radv_cmd_buffer *cmd_buffer, uint64_t va, uint64_t size, const void *data,
                         VkAddressCopyFlagsKHR dst_copy_flags);
+
+void radv_meta_decode_bc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image, VkImageLayout layout,
+                         const VkImageSubresourceLayers *subresource, VkOffset3D offset, VkExtent3D extent);
+/* Call once after a run of radv_meta_decode_bc() calls. n_regions feeds the [BCREGIONS] log. */
+void radv_meta_decode_bc_flush(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image, uint32_t n_regions);
 
 void radv_meta_decode_etc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image, VkImageLayout layout,
                           const VkImageSubresourceLayers *subresource, VkOffset3D offset, VkExtent3D extent);
