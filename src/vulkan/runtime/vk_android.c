@@ -199,6 +199,20 @@ vk_android_import_anb_memory(struct vk_device *device,
 
    int dma_buf_fd = anb->handle->data[0];
 
+   /* The dma-buf is not always the handle's first fd: MediaTek's ARM gralloc handle carries three
+    * and the buffer is the second. The gralloc backend that parsed the handle knows which. */
+   struct u_gralloc *gralloc = vk_android_get_ugralloc();
+   if (gralloc) {
+      struct u_gralloc_buffer_handle gr_handle = {
+         .handle = anb->handle,
+         .hal_format = anb->format,
+         .pixel_stride = anb->stride,
+      };
+      struct u_gralloc_buffer_basic_info info = {0};
+      if (u_gralloc_get_buffer_basic_info(gralloc, &gr_handle, &info) == 0 && info.fds[0] > 0)
+         dma_buf_fd = info.fds[0];
+   }
+
    /* Query image memory requirements for size and supported memory types */
    VkMemoryRequirements mem_reqs;
    device->dispatch_table.GetImageMemoryRequirements(
