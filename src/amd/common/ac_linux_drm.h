@@ -405,6 +405,10 @@ MESAPROC int ac_drm_cs_syncobj_timeline_wait(ac_drm_device *dev, uint32_t *handl
                                          unsigned num_handles, int64_t timeout_nsec, unsigned flags,
                                          uint32_t *first_signaled) TAIL;
 MESAPROC int ac_drm_query_info(ac_drm_device *dev, unsigned info_id, unsigned size, void *value) TAIL;
+/* Log GRBM_STATUS/GRBM_STATUS2/CP_STAT and the CP stall block (tag RADV_GPUSTAT). No BO, CS or
+ * GFXHUB flush, so safe on a suspected wedged GPU. */
+MESAPROC void ac_drm_dump_gpu_status(ac_drm_device *dev, const char *tag);
+
 MESAPROC int ac_drm_read_mm_registers(ac_drm_device *dev, unsigned dword_offset, unsigned count,
                                   uint32_t instance, uint32_t flags, uint32_t *values) TAIL;
 MESAPROC int ac_drm_query_hw_ip_count(ac_drm_device *dev, unsigned type, uint32_t *count) TAIL;

@@ -27,6 +27,10 @@
 #define FAMILY_NV      0x8F //# 143 / Navi: 10
 #define FAMILY_VGH     0x90 //# 144 / Van Gogh
 #define FAMILY_NV3     0x91 //# 145 / Navi: 3x
+/* Samsung Xclipse MGFX generation 1 and 2 (Exynos 1480 / 2400 class). Samsung-private family id:
+ * the sgpu kernel returns AMDGPU_FAMILY_MGFX for MGFX_GEN 1 or 2 and AMDGPU_FAMILY_VGH (144) for
+ * gen 0, so a 920 arrives as VGH and a 530 as this. 147 is unassigned upstream. */
+#define FAMILY_MGFX    0x93 //# 147 / Samsung Xclipse (MGFX gen 1-2)
 #define FAMILY_STX     0x96 //# 150 / Strix
 #define FAMILY_PHX     0x94 //# 148 / Phoenix
 #define FAMILY_GFX1170 0x9A //# 154 / Gfx1170

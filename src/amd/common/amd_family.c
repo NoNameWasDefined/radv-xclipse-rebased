@@ -61,6 +61,7 @@ const char *ac_get_family_name(enum radeon_family family)
    CASE(KRACKAN1);
    CASE(GFX1153);
    CASE(GFX1170);
+   CASE(TITAN);
    CASE(GFX1171);
    CASE(GFX1200);
    CASE(GFX1201);
@@ -167,6 +168,10 @@ const char *ac_get_llvm_processor_name(enum radeon_family family)
       return "gfx1032";
    case CHIP_VANGOGH:
       return "gfx1033";
+   case CHIP_TITAN:
+      /* The Xclipse shader core decodes GFX11 ISA (PAL compiles gfx1100) while the CP and register
+       * state are GFX10_3: the ISA name follows the shader core. */
+      return "gfx1100";
    case CHIP_NAVI24:
       return "gfx1034";
    case CHIP_REMBRANDT:
