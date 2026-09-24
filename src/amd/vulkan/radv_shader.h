@@ -169,6 +169,14 @@ struct radv_graphics_state_key {
       uint8_t polygon_mode : 2; /* VK_POLYGON_MODE_FILL/LINE_POINT */
    } rs;
 
+   /* VK_NV_viewport_swizzle: lowered into the last VGT stage, so it is part of
+    * the shader key. swizzle_count == 0 means no swizzle (or the identity).
+    */
+   struct {
+      uint8_t swizzle_count;
+      uint8_t swizzles[MAX_VIEWPORTS][4];
+   } vp;
+
    struct {
       bool sample_shading_enable : 1;
       bool max_sample_shading_enable : 1;
@@ -528,7 +536,9 @@ struct radv_compiler_info {
       uint32_t instr_prefetch_distance : 8;
       uint32_t rbplus_allowed : 1;
       uint32_t address_prt_wa_control_bit : 8;
-      uint32_t padding : 15;
+      /* The shader core decodes GFX11 encodings with a GFX10_3 register interface (Xclipse 920). */
+      uint32_t gfx11_isa : 1;
+      uint32_t padding : 14;
    } hw;
 
    /* Misc values included as part of the cache key */

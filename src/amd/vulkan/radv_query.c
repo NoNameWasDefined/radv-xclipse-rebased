@@ -101,7 +101,8 @@ radv_emit_event_write(const struct radeon_info *info, struct radv_cmd_stream *cs
          radeon_emit(PKT3(PKT3_EVENT_WRITE_ZPASS, 1, 0));
       } else {
          radeon_emit(PKT3(PKT3_EVENT_WRITE, 2, 0));
-         if (info->gfx_level >= GFX11) {
+         /* Xclipse 920: the DB ignores ZPASS_DONE; it uses the GFX11 PIXEL_PIPE mechanism. */
+         if (info->gfx_level >= GFX11 || info->gfx11_shader_core) {
             radeon_emit(EVENT_TYPE(V_028A90_PIXEL_PIPE_STAT_DUMP) | EVENT_INDEX(1));
          } else {
             radeon_emit(EVENT_TYPE(V_028A90_ZPASS_DONE) | EVENT_INDEX(1));
@@ -2011,8 +2012,11 @@ radv_create_query_pool(struct radv_device *device, const VkQueryPoolCreateInfo *
        (pCreateInfo->queryType == VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT && pdev->info.gfx_level >= GFX11))
       pool->size += 4 * pCreateInfo->queryCount;
 
+   /* PREFER_LOCAL -> VM_ALWAYS_VALID: query pools are long-lived and not shared; their GART bind
+    * moves from submit time to creation. */
    result = radv_bo_create(device, &pool->vk.base, pool->size, 64, RADEON_DOMAIN_GTT,
-                           RADEON_FLAG_NO_INTERPROCESS_SHARING, RADV_BO_PRIORITY_QUERY_POOL, 0, false, &pool->bo);
+                           RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_PREFER_LOCAL_BO,
+                           RADV_BO_PRIORITY_QUERY_POOL, 0, false, &pool->bo);
    if (result != VK_SUCCESS) {
       radv_destroy_query_pool(device, pAllocator, pool);
       return vk_error(device, result);

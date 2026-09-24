@@ -964,6 +964,17 @@ radv_create_dump_dir()
    timep = os_localtime(&raw_time, &result);
    strftime(buf_time, sizeof(buf_time), "%Y.%m.%d_%H.%M.%S", timep);
 
+   /* Hang reports must land where adb can pull them; fall back to HOME if the override can't be
+    * created.
+    */
+   const char *base = getenv("RADV_XCLIPSE_DUMP_DIR");
+   if (base) {
+      snprintf(dump_dir, sizeof(dump_dir), "%s/" RADV_DUMP_DIR "_%d_%s", base, getpid(), buf_time);
+      if (!mkdir(dump_dir, 0774) || errno == EEXIST)
+         return strdup(dump_dir);
+      fprintf(stderr, "radv: can't create directory '%s' (%i), falling back to HOME.\n", dump_dir, errno);
+   }
+
    snprintf(dump_dir, sizeof(dump_dir), "%s/" RADV_DUMP_DIR "_%d_%s", debug_get_option("HOME", "."), getpid(),
             buf_time);
    if (mkdir(dump_dir, 0774) && errno != EEXIST) {
@@ -1175,7 +1186,7 @@ radv_trap_handler_init(struct radv_device *device)
       .has_desc_resource_level = pdev->info.compiler_info.has_desc_resource_level,
    };
 
-   ac_build_buffer_descriptor(pdev->info.gfx_level, &ac_state, desc);
+   ac_build_buffer_descriptor(pdev->info.desc_gfx_level, &ac_state, desc);
 
    memcpy(device->tma_ptr, desc, sizeof(desc));
 

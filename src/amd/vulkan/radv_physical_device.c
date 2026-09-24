@@ -9,7 +9,11 @@
  */
 
 #include <fcntl.h>
+#include <strings.h>
+#include "ac_xclipse_log.h"
+#include <unistd.h>
 #include "util/os_file.h"
+#include "util/os_time.h"
 #include "util/os_misc.h"
 #include "vulkan/vulkan_core.h"
 
@@ -52,6 +56,87 @@ typedef void *drmDevicePtr;
 #else
 #define RADV_SUPPORT_CALIBRATED_TIMESTAMPS 1
 #endif
+
+#if DETECT_OS_ANDROID
+#include <sys/system_properties.h>
+#include <android/log.h>
+#include <dlfcn.h>
+#endif
+
+/* Xclipse flags: env var, or `setprop debug.<prop> 1` for GUI emulators that cannot set our
+ * environment. `prop` omits the "debug." prefix. True if either is non-empty and not "0".
+ * Keep `prop` <= 25 chars: "debug." + prop must fit PROP_NAME_MAX (32) or the lookup silently
+ * fails. */
+static bool
+radv_xclipse_flag(const char *env, const char *prop)
+{
+   const char *e = getenv(env);
+   if (e && e[0] && e[0] != '0')
+      return true;
+#if DETECT_OS_ANDROID
+   char full[PROP_NAME_MAX], val[PROP_VALUE_MAX] = {0};
+   snprintf(full, sizeof(full), "debug.%s", prop);
+   int n = __system_property_get(full, val);
+   if (n > 0 && val[0] && val[0] != '0')
+      return true;
+#else
+   (void)prop;
+#endif
+   return false;
+}
+
+/* For default-on Xclipse features: true only if the env var or debug.<prop> is set to "0". */
+static bool
+radv_xclipse_flag_off(const char *env, const char *prop)
+{
+   const char *e = getenv(env);
+   if (e && e[0])
+      return e[0] == '0';
+#if DETECT_OS_ANDROID
+   char full[PROP_NAME_MAX], val[PROP_VALUE_MAX] = {0};
+   snprintf(full, sizeof(full), "debug.%s", prop);
+   if (__system_property_get(full, val) > 0 && val[0])
+      return val[0] == '0';
+#else
+   (void)prop;
+#endif
+   return false;
+}
+
+/* Allocatable system memory from /proc/meminfo MemAvailable; 0 if unavailable (callers must treat
+ * 0 as "don't clamp"). Queried per frame, possibly from a thread the GPU waits on: raw
+ * open/read/close, no stdio or malloc, cached ~500ms. */
+static uint64_t
+radv_xclipse_mem_available_bytes(void)
+{
+   static uint64_t cached_bytes;
+   static int64_t cached_at;
+
+   const int64_t now = os_time_get_nano();
+   const int64_t age = now - cached_at;
+   if (cached_at && age >= 0 && age < 500000000ll)
+      return cached_bytes;
+
+   uint64_t out = 0;
+   int fd = open("/proc/meminfo", O_RDONLY | O_CLOEXEC);
+   if (fd >= 0) {
+      char buf[2048];
+      ssize_t n = read(fd, buf, sizeof(buf) - 1);
+      close(fd);
+      if (n > 0) {
+         buf[n] = '\0';
+         const char *p = strstr(buf, "MemAvailable:");
+         if (p) {
+            p += strlen("MemAvailable:");
+            out = (uint64_t)strtoull(p, NULL, 10) * 1024ull; /* the field is in kB */
+         }
+      }
+   }
+
+   cached_bytes = out;
+   cached_at = now;
+   return out;
+}
 
 static bool
 radv_perf_query_supported(const struct radv_physical_device *pdev)
@@ -283,7 +368,11 @@ radv_is_dcc_disabled(const struct radv_physical_device *pdev)
 {
    const struct radv_instance *instance = radv_physical_device_instance(pdev);
 
-   return instance->debug_flags & RADV_DEBUG_NO_DCC ||
+   /* Xclipse: off unless RADV_XCLIPSE_DCC. It was disabled for black sampled render targets in Dark
+    * Souls, which turned out to be occlusion queries; the vendor driver compresses its render
+    * targets on the 530 (DCC_ENABLE, 128B independent blocks), which is most of why the same draws
+    * and clears cost it a half to a quarter of the GPU time. */
+   return instance->debug_flags & RADV_DEBUG_NO_DCC || (pdev->info.gfx11_shader_core && !pdev->xclipse_dcc) ||
           (instance->drirc.debug.disable_dcc && pdev->info.gfx_level < GFX12);
 }
 
@@ -324,6 +413,126 @@ parse_hex(char *out, const char *in, unsigned length)
    }
 }
 
+#if DETECT_OS_ANDROID
+extern char **environ;
+
+struct radv_xclipse_knob_list {
+   char *items[256];
+   unsigned count;
+};
+
+static bool radv_xclipse_knob_is_diagnostic(const char *entry);
+
+static void
+radv_xclipse_knob_prop_value(void *cookie, const char *name, const char *value, uint32_t serial)
+{
+   struct radv_xclipse_knob_list *l = cookie;
+   (void)serial;
+   if (strncmp(name, "debug.radv", 10) || !value[0] || l->count >= ARRAY_SIZE(l->items) ||
+       radv_xclipse_knob_is_diagnostic(name))
+      return;
+   size_t n = strlen(name) + strlen(value) + 2;
+   char *s = malloc(n);
+   if (!s)
+      return;
+   snprintf(s, n, "%s=%s", name, value);
+   l->items[l->count++] = s;
+}
+
+static void
+radv_xclipse_knob_prop(const prop_info *pi, void *cookie)
+{
+   __system_property_read_callback(pi, radv_xclipse_knob_prop_value, cookie);
+}
+
+/* Diagnostics-only knobs are excluded, so enabling logging does not invalidate every cached shader.
+ * Matched exactly on the name ("NAME=value" for env). */
+static bool
+radv_xclipse_knob_is_diagnostic(const char *entry)
+{
+   static const char *const diag[] = {
+      "RADV_XCLIPSE_LOG",     "debug.radv_xclipse_log",
+      "RADV_XCLIPSE_PERF",    "debug.radv_xclipse_perf",
+      "RADV_XCLIPSE_PERF_MS", "debug.radv_xclipse_perf_ms",
+   };
+   const size_t len = strcspn(entry, "=");
+   for (unsigned i = 0; i < ARRAY_SIZE(diag); i++) {
+      if (strlen(diag[i]) == len && !strncmp(entry, diag[i], len))
+         return true;
+   }
+   return false;
+}
+
+static int
+radv_xclipse_knob_cmp(const void *a, const void *b)
+{
+   return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+/* Fold every live RADV knob into the cache UUID (disk cache directory and pipelineCacheUUID).
+ * debug.radv_* properties and RADV_* / ACO_* / AMD_* / NIR_* env can change codegen without
+ * changing the build. Empty env vars count (some sites test getenv() != NULL); empty properties
+ * don't. Sorted, so enumeration order does not matter. */
+static void
+radv_xclipse_hash_knobs(blake3_hasher *ctx)
+{
+   struct radv_xclipse_knob_list l = {0};
+   for (char **e = environ; e && *e; e++) {
+      if ((!strncmp(*e, "RADV_", 5) || !strncmp(*e, "ACO_", 4) || !strncmp(*e, "AMD_", 4) ||
+           !strncmp(*e, "NIR_", 4)) &&
+          l.count < ARRAY_SIZE(l.items) && !radv_xclipse_knob_is_diagnostic(*e)) {
+         char *s = strdup(*e);
+         if (s)
+            l.items[l.count++] = s;
+      }
+   }
+   __system_property_foreach(radv_xclipse_knob_prop, &l);
+   qsort(l.items, l.count, sizeof(l.items[0]), radv_xclipse_knob_cmp);
+   for (unsigned i = 0; i < l.count; i++)
+      _mesa_blake3_update(ctx, l.items[i], strlen(l.items[i]) + 1);
+   AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_ARM", "[ARM] cache_uuid folds %u knob(s)%s", l.count,
+                       l.count ? "" : " -- none set, UUID = build-id only");
+   for (unsigned i = 0; i < l.count; i++)
+      free(l.items[i]);
+}
+
+/* Android disk shader cache. Upstream disables it on Android and apps have no HOME, so the builtin
+ * BCn decoders recompiled every launch (0.5-0.8 s on the recording thread).
+ * Directory: $TMPDIR, else the directory our .so was loaded from. Only /data/ paths (never FUSE
+ * external storage: cache reads run on the compiling thread). Writes use the cache's own thread,
+ * without fsync. MESA_SHADER_CACHE_DISABLE still turns it off. */
+static void
+radv_xclipse_android_disk_cache(const struct radv_physical_device *pdev)
+{
+   if (pdev->info.pci_id != 0x73a0)
+      return;
+
+   char dir[512] = {0};
+   const char *how = "no writable app-private dir, cache stays off";
+   const char *t = getenv("TMPDIR");
+   if (t && !strncmp(t, "/data/", 6) && access(t, W_OK) == 0) {
+      snprintf(dir, sizeof(dir), "%s", t);
+      how = "TMPDIR";
+   } else {
+      Dl_info info;
+      if (dladdr(radv_xclipse_android_disk_cache, &info) && info.dli_fname &&
+          !strncmp(info.dli_fname, "/data/", 6)) {
+         snprintf(dir, sizeof(dir), "%s", info.dli_fname);
+         char *slash = strrchr(dir, '/');
+         if (slash)
+            *slash = '\0';
+         if (access(dir, W_OK) == 0)
+            how = "driver dir";
+         else
+            dir[0] = '\0';
+      }
+   }
+
+   disk_cache_set_default_dir(dir[0] ? dir : NULL);
+   AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_ARM", "[ARM] diskcache dir=%s (%s)", dir[0] ? dir : "NONE", how);
+}
+#endif
+
 static int
 radv_device_get_cache_uuid(struct radv_physical_device *pdev, void *uuid)
 {
@@ -343,6 +552,11 @@ radv_device_get_cache_uuid(struct radv_physical_device *pdev, void *uuid)
 #else
    if (!disk_cache_get_function_identifier(radv_device_get_cache_uuid, &ctx))
       return -1;
+#endif
+
+#if DETECT_OS_ANDROID
+   if (pdev->info.pci_id == 0x73a0)
+      radv_xclipse_hash_knobs(&ctx);
 #endif
 
 #if AMD_LLVM_AVAILABLE
@@ -457,6 +671,40 @@ radv_get_vram_size(struct radv_physical_device *pdev)
    return total_size - MIN2(total_size, (uint64_t)pdev->info.vram_vis_size_kb * 1024);
 }
 
+/* PAL-parity heap topology. The vendor exposes two DEVICE_LOCAL heaps on this zero-VRAM chip:
+ * 8192 MB and a synthesized 64 MB one. Types on the second heap allocate identically to their
+ * heap-0 twins (same GEM_CREATE and VA maps), its size is not enforced, and PAL never steers
+ * memory there, so it only changes what apps see. The big heap keeps its full size; the new types
+ * are appended so no type index moves. The synthesized heap reports a 60 MB budget and no usage.
+ * Default on for 0x73a0. RADV_XCLIPSE_PAL_HEAPS=0 / debug.radv_xclipse_pal_heaps 0 restores the
+ * single heap. Both arms log [ARM]. */
+static bool
+radv_xclipse_pal_heaps(const struct radv_physical_device *pdev)
+{
+   if (pdev->info.pci_id != 0x73a0)
+      return false;
+
+   const char *src = "default";
+   int v = 1;
+   const char *e = getenv("RADV_XCLIPSE_PAL_HEAPS");
+   if (e) {
+      v = atoi(e);
+      src = "env";
+   }
+#ifdef __ANDROID__
+   else {
+      char pbuf[PROP_VALUE_MAX] = {0};
+      if (__system_property_get("debug.radv_xclipse_pal_heaps", pbuf) > 0 && pbuf[0]) {
+         v = atoi(pbuf);
+         src = "prop";
+      }
+   }
+   AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_ARM", "[ARM] pal_heaps=%d (%s) -- %s", v, src,
+                       v ? "8192MB heap + synthesized 64MB heap, like PAL" : "single heap (v193 layout)");
+#endif
+   return v != 0;
+}
+
 static void
 radv_physical_device_init_mem_types(struct radv_physical_device *pdev)
 {
@@ -468,6 +716,7 @@ radv_physical_device_init_mem_types(struct radv_physical_device *pdev)
 
    pdev->memory_properties.memoryHeapCount = 0;
    pdev->heaps = 0;
+   pdev->xclipse_pal_heap_index = -1;
 
    if (!pdev->info.has_dedicated_vram) {
       const uint64_t total_size = gtt_size + visible_vram_size;
@@ -509,9 +758,15 @@ radv_physical_device_init_mem_types(struct radv_physical_device *pdev)
    if (gtt_size > 0) {
       gart_index = pdev->memory_properties.memoryHeapCount++;
       pdev->heaps |= RADV_HEAP_GTT;
+      /* On SoC amdgpu forks with no VRAM (e.g. Samsung Xclipse 920) the only heap is GTT. Mark it
+       * DEVICE_LOCAL so apps see a usable local heap; BO placement stays RADEON_DOMAIN_GTT.
+       * Tests visible_vram_size: visible_vram_index is not set yet here.
+       */
+      const VkMemoryHeapFlags gtt_heap_flags =
+         (vram_index < 0 && visible_vram_size == 0) ? VK_MEMORY_HEAP_DEVICE_LOCAL_BIT : 0;
       pdev->memory_properties.memoryHeaps[gart_index] = (VkMemoryHeap){
          .size = gtt_size,
-         .flags = 0,
+         .flags = gtt_heap_flags,
       };
    }
 
@@ -584,7 +839,32 @@ radv_physical_device_init_mem_types(struct radv_physical_device *pdev)
                           VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
          .heapIndex = gart_index,
       };
+
+      /* DEVICE_LOCAL-only type (no HOST_VISIBLE). With vram_size_kb == 0 RADV only advertised
+       * host-visible types; the vendor advertises device-local-only ones too, and allocators like
+       * DXVK use them for memory that never needs CPU mapping. Appended so existing type indices
+       * don't move. Only on a DEVICE_LOCAL GTT heap (not in the two-heap APU layout). */
+      if (pdev->info.gfx11_shader_core &&
+          (pdev->memory_properties.memoryHeaps[gart_index].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) {
+         pdev->memory_domains[type_count] = RADEON_DOMAIN_GTT;
+         pdev->memory_flags[type_count] = RADEON_FLAG_NO_CPU_ACCESS;
+         pdev->memory_properties.memoryTypes[type_count++] = (VkMemoryType){
+            .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            .heapIndex = gart_index,
+         };
+      }
    }
+   /* If the only heap is the GTT heap relabeled DEVICE_LOCAL above, propagate the bit to its types:
+    * UMA apps need a DEVICE_LOCAL | HOST_VISIBLE type (Winlator aborts without one), and the vendor
+    * marks every type DEVICE_LOCAL. Placement stays GTT. */
+   if (gart_index >= 0 &&
+       (pdev->memory_properties.memoryHeaps[gart_index].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) {
+      for (unsigned i = 0; i < type_count; i++) {
+         if (pdev->memory_properties.memoryTypes[i].heapIndex == (uint32_t)gart_index)
+            pdev->memory_properties.memoryTypes[i].propertyFlags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+      }
+   }
+
    pdev->memory_properties.memoryTypeCount = type_count;
 
    if (radv_tmz_enabled(pdev)) {
@@ -658,6 +938,39 @@ radv_physical_device_init_mem_types(struct radv_physical_device *pdev)
             };
          }
       }
+      pdev->memory_properties.memoryTypeCount = type_count;
+   }
+
+   /* PAL-parity second heap, see radv_xclipse_pal_heaps(). Only on the single device-local GTT heap
+    * layout, never with real or APU-split VRAM. */
+   if (gart_index >= 0 && vram_index < 0 && visible_vram_index < 0 &&
+       (pdev->memory_properties.memoryHeaps[gart_index].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) &&
+       pdev->memory_properties.memoryHeapCount < VK_MAX_MEMORY_HEAPS && type_count + 2 <= VK_MAX_MEMORY_TYPES &&
+       radv_xclipse_pal_heaps(pdev)) {
+      const int pal_heap = pdev->memory_properties.memoryHeapCount++;
+      pdev->xclipse_pal_heap_index = pal_heap;
+      pdev->memory_properties.memoryHeaps[pal_heap] = (VkMemoryHeap){
+         .size = 64ull << 20,
+         .flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT,
+      };
+
+      /* host-visible twin of type 0 (same domain and flags => the same GEM_CREATE) */
+      pdev->memory_domains[type_count] = RADEON_DOMAIN_GTT;
+      pdev->memory_flags[type_count] = RADEON_FLAG_GTT_WC | RADEON_FLAG_CPU_ACCESS;
+      pdev->memory_properties.memoryTypes[type_count++] = (VkMemoryType){
+         .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+         .heapIndex = pal_heap,
+      };
+
+      /* device-local-only twin */
+      pdev->memory_domains[type_count] = RADEON_DOMAIN_GTT;
+      pdev->memory_flags[type_count] = RADEON_FLAG_NO_CPU_ACCESS;
+      pdev->memory_properties.memoryTypes[type_count++] = (VkMemoryType){
+         .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+         .heapIndex = pal_heap,
+      };
+
       pdev->memory_properties.memoryTypeCount = type_count;
    }
 
@@ -989,6 +1302,12 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
       .MESA_image_alignment_control = pdev->info.gfx_level >= GFX9,
       .NV_compute_shader_derivatives = true,
       .NV_cooperative_matrix2 = radv_cooperative_matrix2_nv_enabled(pdev),
+      /* NV extensions, lowered in NIR: a passthrough GS is rebuilt as an ordinary one,
+       * gl_ViewportMask[] becomes gl_ViewportIndex (multi-bit broadcast is not implemented), and
+       * the swizzle is folded into the last pre-raster stage. */
+      .NV_geometry_shader_passthrough = true,
+      .NV_viewport_array2 = true,
+      .NV_viewport_swizzle = true,
       .VALVE_mutable_descriptor_type = true,
       .VALVE_shader_mixed_float_dot_product = pdev->info.compiler_info.has_accelerated_dot_product,
       .VALVE_video_encode_rgb_conversion =
@@ -1030,9 +1349,11 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
       .alphaToOne = true,
       .multiViewport = true,
       .samplerAnisotropy = true,
-      .textureCompressionETC2 = pdev->info.has_etc_support || pdev->emulate_etc2,
-      .textureCompressionASTC_LDR = pdev->emulate_astc,
-      .textureCompressionBC = true,
+      .textureCompressionETC2 = pdev->info.has_etc_support || pdev->emulate_etc2 || pdev->xclipse_native_etc2,
+      .textureCompressionASTC_LDR = pdev->emulate_astc || pdev->xclipse_native_astc,
+      /* The feature covers all BC formats; Xclipse 920 decodes only BC1-BC3 in hardware, so it
+       * needs the BC4-BC7 GPU decoder. */
+      .textureCompressionBC = !pdev->info.gfx11_shader_core || pdev->emulate_bc,
       .occlusionQueryPrecise = true,
       .pipelineStatisticsQuery = true,
       .vertexPipelineStoresAndAtomics = true,
@@ -1786,7 +2107,12 @@ radv_get_physical_device_properties(struct radv_physical_device *pdev)
    size_t max_descriptor_set_size = radv_max_descriptor_set_size();
 
    VkPhysicalDeviceType device_type;
-   if (pdev->info.has_dedicated_vram) {
+   /* The Samsung Xclipse 920 is an integrated GPU, but its kernel does not set
+    * AMDGPU_IDS_FLAGS_FUSION, so has_dedicated_vram stays true. Report INTEGRATED.
+    */
+   if (pdev->info.pci_id == 0x73a0) {
+      device_type = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+   } else if (pdev->info.has_dedicated_vram) {
       device_type = VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
    } else {
       device_type = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
@@ -1823,7 +2149,9 @@ radv_get_physical_device_properties(struct radv_physical_device *pdev)
       .apiVersion = pdev->info.gfx_level >= GFX8 ? RADV_API_VERSION : RADV_API_VERSION_1_3,
 #endif
       .driverVersion = vk_get_driver_version(),
-      .vendorID = ATI_VENDOR_ID,
+      /* Xclipse 920: report Samsung's vendor ID (0x144d) like the vendor ICD. With AMD's 0x1002
+       * Windows games take AMD-specific paths that fail under Wine/Winlator. */
+      .vendorID = pdev->info.gfx11_shader_core ? 0x144d : ATI_VENDOR_ID,
       .deviceID = pdev->info.pci_id,
       .deviceType = device_type,
       .maxImageDimension1D = pdev->image_props.max_dims.width,
@@ -2682,13 +3010,28 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
 
 #if DETECT_OS_ANDROID
    pdev->emulate_etc2 = !pdev->info.has_etc_support;
-   pdev->emulate_astc = true;
+   /* BC4-BC7 GPU decode (radv_meta_bc_decode.c). Apps that re-upload every frame (Eden) can drown
+    * the GPU in decode dispatches; disabling makes them use BC1/BC3, decoded in hardware.
+    * RADV_XCLIPSE_NO_BC_EMU=1 or setprop debug.radv_xclipse_no_bc_emu 1. */
+   pdev->emulate_bc =
+      pdev->info.gfx11_shader_core && !radv_xclipse_flag("RADV_XCLIPSE_NO_BC_EMU", "radv_xclipse_no_bc_emu");
+   pdev->xclipse_dcc = pdev->info.gfx11_shader_core && !radv_xclipse_flag_off("RADV_XCLIPSE_DCC", "radv_xclipse_dcc");
+   /* The texture unit decodes ASTC and ETC2/EAC in hardware (codes measured, see
+    * ac_xclipse_astc_img_format() and ac_xclipse_etc2_img_format()), so neither is emulated. */
+   pdev->xclipse_native_astc = pdev->info.gfx11_shader_core;
+   pdev->emulate_astc = !pdev->xclipse_native_astc;
+   pdev->xclipse_native_etc2 = pdev->info.gfx11_shader_core;
+   if (pdev->xclipse_native_etc2)
+      pdev->emulate_etc2 = false;
 #else
    pdev->emulate_etc2 = !pdev->info.has_etc_support && instance->drirc.features.require_etc2;
+   /* BC4-BC7 GPU decode, see above. */
+   pdev->emulate_bc =
+      pdev->info.gfx11_shader_core && !radv_xclipse_flag("RADV_XCLIPSE_NO_BC_EMU", "radv_xclipse_no_bc_emu");
    pdev->emulate_astc = instance->drirc.features.require_astc;
 #endif
 
-   const char *name = ac_get_family_name(pdev->info.family);
+   const char *name = ac_get_gpu_display_name(&pdev->info);
    snprintf(pdev->name, sizeof(pdev->name), "AMD RADV %s%s", name, radv_get_compiler_string(pdev));
    snprintf(pdev->marketing_name, sizeof(pdev->name), "%s (RADV %s%s)", pdev->info.marketing_name, name,
             radv_get_compiler_string(pdev));
@@ -2702,7 +3045,10 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
 
    pdev->dcc_msaa_allowed = (instance->perftest_flags & RADV_PERFTEST_DCC_MSAA);
 
-   pdev->use_fmask = pdev->info.compiler_info.has_fmask && !(instance->debug_flags & RADV_DEBUG_NO_FMASK);
+   /* Xclipse 920: MSAA the GFX11 way, without FMASK (the texture unit's fmask fetch never engages for
+    * our descriptors). Bit-identical to the vendor. */
+   pdev->use_fmask = pdev->info.compiler_info.has_fmask && !(instance->debug_flags & RADV_DEBUG_NO_FMASK) &&
+                     !pdev->info.gfx11_shader_core;
 
    pdev->force_64_byte_sampled_image = !pdev->use_fmask && instance->drirc.debug.force_64_byte_sampled_image;
 
@@ -2809,6 +3155,9 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
     */
    char buf[VK_UUID_SIZE * 2 + 1];
    mesa_bytes_to_hex(buf, pdev->cache_uuid, VK_UUID_SIZE);
+#if DETECT_OS_ANDROID
+   radv_xclipse_android_disk_cache(pdev);
+#endif
    pdev->vk.disk_cache = disk_cache_create("RADV", buf, 0);
 
    pdev->disk_cache_meta =
@@ -2898,6 +3247,8 @@ create_drm_physical_device(struct vk_instance *vk_instance, struct _drmDevice *d
 #endif
 
    supported_device |= device->bustype == DRM_BUS_PCI && device->deviceinfo.pci->vendor_id == ATI_VENDOR_ID;
+
+   supported_device |= device->bustype == DRM_BUS_PLATFORM;
 
    if (!supported_device)
       return VK_ERROR_INCOMPATIBLE_DRIVER;
@@ -3392,7 +3743,29 @@ radv_get_memory_budget_properties(VkPhysicalDevice physicalDevice,
             ++heap;
          }
 
+         /* The synthesized PAL-parity heap is not in pdev->heaps; its allocations count in the GTT
+          * heap. Reports a 60 MB budget (size minus 1/16) and no usage, like PAL. */
+         if (pdev->xclipse_pal_heap_index >= 0 && heap == (unsigned)pdev->xclipse_pal_heap_index) {
+            const uint64_t pal_size = memory_properties->memoryHeaps[heap].size;
+            memoryBudget->heapBudget[heap] = pal_size - (pal_size >> 4);
+            memoryBudget->heapUsage[heap] = 0;
+            ++heap;
+         }
+
          assert(heap == memory_properties->memoryHeapCount);
+      }
+   }
+
+   /* Honest budget. has_dedicated_vram is true on this APU, so the discrete branch reports
+    * heap_size - usage and ignores system memory (budget 7432MB with 3.5GB MemAvailable). Clamp the
+    * budget to real available memory. Never clamp the heap size: that hard-crashed the phone. */
+   const uint64_t avail = radv_xclipse_mem_available_bytes();
+   if (avail) {
+      for (uint32_t i = 0; i < memory_properties->memoryHeapCount; i++) {
+         /* Never below what this process already holds (negative headroom). */
+         const uint64_t floor_b = memoryBudget->heapUsage[i];
+         const uint64_t honest = MAX2(avail + floor_b, floor_b);
+         memoryBudget->heapBudget[i] = MIN2(memoryBudget->heapBudget[i], honest);
       }
    }
 

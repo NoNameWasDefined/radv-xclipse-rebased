@@ -9,6 +9,7 @@
  */
 
 #include "meta/radv_meta.h"
+#include "ac_xclipse_log.h"
 #include "nir/nir.h"
 #include "nir/nir_serialize.h"
 #include "nir/nir_xfb_info.h"
@@ -16,6 +17,15 @@
 #include "tools/radv_rmv.h"
 #include "util/mesa-blake3.h"
 #include "util/os_time.h"
+#include "vk_xclipse_perf.h"
+
+#if DETECT_OS_ANDROID
+#include <android/log.h>
+/* Diagnostics here go to the Android log: Eden captures nothing from stderr. */
+#define RADV_EXT_LOG(...) AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_EXT", __VA_ARGS__)
+#else
+#define RADV_EXT_LOG(...) fprintf(stderr, __VA_ARGS__)
+#endif
 #include "util/u_atomic.h"
 #include "radv_device.h"
 #include "radv_entrypoints.h"
@@ -717,9 +727,9 @@ radv_pipeline_init_vertex_input_state(const struct radv_device *device, struct r
    struct radv_dynamic_state *dynamic = &pipeline->dynamic_state;
 
    if (vs->info.vs.use_per_attribute_vb_descs) {
-      const enum amd_gfx_level gfx_level = pdev->info.gfx_level;
       const bool alpha_adjust = pdev->info.compiler_info.has_vtx_format_alpha_adjust_bug;
-      const struct ac_vtx_format_info *vtx_info_table = ac_get_vtx_format_info_table(gfx_level, alpha_adjust);
+      const struct ac_vtx_format_info *vtx_info_table =
+         ac_get_vtx_format_info_table(pdev->info.desc_gfx_level, alpha_adjust);
 
       dynamic->vertex_input.bindings_match_attrib = true;
 
@@ -1670,7 +1680,8 @@ radv_generate_graphics_state_key(const struct radv_compiler_info *compiler_info,
          }
 
          const struct ac_vtx_format_info *vtx_info = ac_get_vtx_format_info(
-            compiler_info->ac->gfx_level, compiler_info->ac->has_vtx_format_alpha_adjust_bug, format);
+            compiler_info->ac->desc_gfx_level, compiler_info->ac->has_vtx_format_alpha_adjust_bug,
+            format);
          unsigned attrib_align = vtx_info->chan_byte_size ? vtx_info->chan_byte_size : vtx_info->element_size;
 
          /* If offset is misaligned, then the buffer offset must be too. Just skip updating
@@ -1736,6 +1747,16 @@ radv_generate_graphics_state_key(const struct radv_compiler_info *compiler_info,
 
       if (!BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_CULL_MODE))
          key.rs.cull_mode = state->rs->cull_mode;
+   }
+
+   /* VK_NV_viewport_swizzle. The identity swizzle is the same as not having the
+    * extension at all, so don't put it in the key -- that would needlessly split
+    * the pipeline cache for apps that chain the struct and leave it default.
+    */
+   if (state->vp && state->vp->swizzle_count &&
+       !radv_nir_viewport_swizzle_is_identity(state->vp->swizzles, state->vp->swizzle_count)) {
+      key.vp.swizzle_count = state->vp->swizzle_count;
+      memcpy(key.vp.swizzles, state->vp->swizzles, sizeof(key.vp.swizzles));
    }
 
    key.dynamic_rasterization_samples = BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES) ||
@@ -2543,6 +2564,70 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
 
    if (stages[MESA_SHADER_VERTEX].nir && !gfx_state->vs.has_prolog)
       NIR_PASS(_, stages[MESA_SHADER_VERTEX].nir, radv_nir_optimize_vs_inputs_to_const, gfx_state);
+
+   /* VK_NV_geometry_shader_passthrough is lowered in radv_shader_spirv_to_nir(), before
+    * nir_split_per_member_structs().
+    */
+   /* VK_NV_viewport_array2: gl_ViewportMask[] -> gl_ViewportIndex. Must run before the swizzle pass,
+    * which selects the per-viewport swizzle from the gl_ViewportIndex store.
+    */
+   radv_foreach_stage (i, active_nir_stages) {
+      if (!radv_is_last_vgt_stage(&stages[i]))
+         continue;
+
+      bool multi_bit = false;
+      bool lowered = false;
+      NIR_PASS(lowered, stages[i].nir, radv_nir_lower_viewport_mask, &multi_bit);
+
+      /* Log once per process whether the title uses gl_ViewportMask. */
+      if (lowered) {
+         static bool announced = false;
+         if (!announced) {
+            announced = true;
+            RADV_EXT_LOG("VK_NV_viewport_array2: this title writes gl_ViewportMask; lowering it "
+                         "(first use, in %s)",
+                         _mesa_shader_stage_to_string(i));
+         }
+      }
+
+      if (multi_bit) {
+         static bool warned = false;
+         if (!warned) {
+            warned = true;
+            RADV_EXT_LOG("VK_NV_viewport_array2: gl_ViewportMask with more than one bit set in %s; "
+                         "broadcasting to several viewports is not implemented, rendering to the "
+                         "lowest set viewport only",
+                         _mesa_shader_stage_to_string(i));
+         }
+      }
+      break;
+   }
+
+   /* VK_NV_viewport_swizzle has to be lowered while shader outputs are still
+    * derefs, so it runs before radv_nir_lower_io() below. Only the stage that
+    * actually feeds the rasterizer matters.
+    */
+   if (gfx_state->vp.swizzle_count) {
+      radv_foreach_stage (i, active_nir_stages) {
+         if (!radv_is_last_vgt_stage(&stages[i]))
+            continue;
+
+         bool incomplete = false;
+         NIR_PASS(_, stages[i].nir, radv_nir_lower_viewport_swizzle, gfx_state->vp.swizzles,
+                  gfx_state->vp.swizzle_count, &incomplete);
+
+         if (incomplete) {
+            static bool warned = false;
+            if (!warned) {
+               warned = true;
+               RADV_EXT_LOG("VK_NV_viewport_swizzle: COULD NOT RESOLVE the viewport index in %s -- "
+                            "falling back to viewport 0's swizzle. Geometry selecting a non-zero "
+                            "viewport is being swizzled WRONG", _mesa_shader_stage_to_string(i));
+            }
+         }
+         break;
+      }
+   }
 
    radv_foreach_stage (i, active_nir_stages) {
       int64_t stage_start = os_time_get_nano();
@@ -3459,6 +3544,11 @@ radv_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache, ui
    VkResult result = VK_SUCCESS;
    unsigned i = 0;
 
+   /* Perf accounting, off by default (vk_xclipse_perf.h): pipeline creation on the render thread
+    * is a frame stall. */
+   const bool xperf = vk_xclipse_perf_enabled();
+   const uint64_t xperf_t0 = xperf ? os_time_get_nano() : 0;
+
    for (; i < count; i++) {
       const VkPipelineCreateFlagBits2 create_flags = vk_graphics_pipeline_create_flags(&pCreateInfos[i]);
       VkResult r;
@@ -3478,6 +3568,20 @@ radv_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache, ui
 
    for (; i < count; ++i)
       pPipelines[i] = VK_NULL_HANDLE;
+
+   if (xperf) {
+      /* Count pipelines with a geometry stage (does toggling an extension change GS fallback use?). */
+      uint32_t gs_count = 0;
+      for (uint32_t p = 0; p < count; p++) {
+         for (uint32_t st = 0; st < pCreateInfos[p].stageCount; st++) {
+            if (pCreateInfos[p].pStages[st].stage == VK_SHADER_STAGE_GEOMETRY_BIT) {
+               gs_count++;
+               break;
+            }
+         }
+      }
+      vk_xclipse_perf_pipeline(os_time_get_nano() - xperf_t0, count, gs_count);
+   }
 
    return result;
 }

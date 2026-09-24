@@ -167,10 +167,18 @@ radv_create_descriptor_pool(struct radv_device *device, const VkDescriptorPoolCr
 
    if (bo_size) {
       if (!(pCreateInfo->flags & VK_DESCRIPTOR_POOL_CREATE_HOST_ONLY_BIT_EXT)) {
-         enum radeon_bo_flag flags = RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_READ_ONLY | RADEON_FLAG_32BIT;
+         enum radeon_bo_flag flags = RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_READ_ONLY |
+                                     RADEON_FLAG_32BIT |
+                                     RADEON_FLAG_XCLIPSE_CACHEABLE /* descriptor data; the winsys
+                                        * skips the pool if ZERO_VRAM is set below */;
 
          if (radv_device_should_clear_vram(device))
             flags |= RADEON_FLAG_ZERO_VRAM;
+
+         /* Small descriptor pools (<= 4KB) -> PREFER_LOCAL (VM_ALWAYS_VALID): they churn at startup,
+          * each a first GART bind. Size-gated because bo_size is app-controlled. */
+         if (bo_size <= 4096)
+            flags |= RADEON_FLAG_PREFER_LOCAL_BO;
 
          result = radv_bo_create(device, &pool->base, bo_size, 32, RADEON_DOMAIN_VRAM, flags,
                                  RADV_BO_PRIORITY_DESCRIPTOR, 0, false, &pool->bo);

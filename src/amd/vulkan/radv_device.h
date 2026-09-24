@@ -95,6 +95,16 @@ struct radv_meta_state {
 
    struct vk_texcompress_astc_state *astc_decode;
 
+   /* BCn decode: census histogram (+ [BCCONTENT] ring) and the BC5 -> EAC LUT. Per device: a second
+    * VkDevice in the same process must not bind the first device's freed BOs. */
+   struct {
+      struct radeon_winsys_bo *hist_bo;
+      uint32_t *hist_ptr;
+      uint64_t hist_va;
+      struct radeon_winsys_bo *eac_lut_bo;
+      uint64_t eac_lut_va;
+   } xclipse_bc;
+
    struct vk_meta_device device;
 };
 
