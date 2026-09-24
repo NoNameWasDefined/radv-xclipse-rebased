@@ -404,6 +404,10 @@ typedef struct {
    enum amd_gfx_level gfx_level;
    bool use_aco;
 
+   /* Xclipse 920: GFX11 export conventions (packed dwords with a per-VGPR enable mask, no COMPR)
+    * with gfx_level GFX10_3. */
+   bool gfx11_export_conventions;
+
    /* System values. */
    bool bc_optimize_for_persp;
    bool bc_optimize_for_linear;
