@@ -10,9 +10,13 @@
  */
 
 #include <stdio.h>
+#include "ac_xclipse_log.h"
 
 #include "tools/radv_debug.h"
 #include "radv_amdgpu_bo.h"
+#include "ac_cmdbuf.h"
+#include "radv_logcat.h"
+#include <android/log.h>
 
 #include <inttypes.h>
 #include <pthread.h>
@@ -28,7 +32,177 @@
 #include "util/u_math.h"
 #include "util/u_memory.h"
 
+#include <stdint.h>
+#include <stdlib.h>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
+
 static void radv_amdgpu_winsys_bo_destroy(struct radeon_winsys *_ws, struct radeon_winsys_bo *_bo);
+
+/* BO churn accounting. No SDMA here, so every kernel TLB flush takes the raw MMIO ENG17 path; each
+ * GART bind/unbind is one flush. Reported with debug.radv_xclipse_log 1. */
+
+/* Size histogram of created BOs, powers of 4 from 16KB. */
+static uint32_t radv_xclipse_bo_hist[8];
+static const char *const radv_xclipse_bo_hist_name[8] = {"<16K", "<64K", "<256K", "<1M",
+                                                         "<4M",  "<16M", "<64M",  ">=64M"};
+
+static unsigned
+radv_xclipse_size_bucket(uint64_t size)
+{
+   unsigned b = 0;
+   uint64_t lim = 16 * 1024;
+   while (b < 7 && size >= lim) {
+      lim *= 4;
+      b++;
+   }
+   return b;
+}
+
+static void
+radv_xclipse_bo_churn(struct radv_amdgpu_winsys *ws, uint64_t size, bool created)
+{
+   static uint32_t n_create, n_destroy;
+   static uint64_t bytes_created;
+   /* Live footprint (bytes_created is cumulative). */
+   static uint64_t live_bytes;
+   static int64_t t_last;
+
+   if (created) {
+      p_atomic_inc(&radv_xclipse_bo_hist[radv_xclipse_size_bucket(size)]);
+      p_atomic_inc(&n_create);
+      p_atomic_add(&bytes_created, size);
+      p_atomic_add(&live_bytes, size);
+   } else {
+      p_atomic_inc(&n_destroy);
+      p_atomic_add(&live_bytes, -(int64_t)size);
+   }
+
+   /* Count create and destroy events: both GART bind and unbind flush the TLB, so events/s
+    * approximates the flush rate. Report the first event, then every 64. */
+   uint32_t nc = p_atomic_read(&n_create), nd = p_atomic_read(&n_destroy);
+   uint32_t ev = nc + nd;
+   if (ev != 1 && (ev & 0x3f))
+      return;
+   /* The report queries the kernel three times; only when logging. */
+   if (ac_xclipse_log_level() < 1)
+      return;
+
+   int64_t now = os_time_get_nano();
+   int64_t dt = t_last ? now - t_last : 0;
+   t_last = now;
+
+   /* Kernel counters:
+    *   gtt_usage  - bytes resident in GTT (the whole budget, no VRAM)
+    *   evictions  - BOs evicted (monotonic)
+    *   moved      - bytes moved by evictions
+    * Failed queries report 0. */
+   uint64_t gtt_usage = 0, evictions = 0, moved = 0;
+   if (ws && ws->dev) {
+      struct amdgpu_heap_info heap = {0};
+      if (ac_drm_query_heap_info(ws->dev, AMDGPU_GEM_DOMAIN_GTT, 0, &heap) == 0)
+         gtt_usage = heap.heap_usage;
+      ac_drm_query_info(ws->dev, AMDGPU_INFO_NUM_EVICTIONS, 8, &evictions);
+      ac_drm_query_info(ws->dev, AMDGPU_INFO_NUM_BYTES_MOVED, 8, &moved);
+   }
+   /* allocMB is cumulative, liveMB is resident, gttMB is the kernel's number.
+    * Filter: adb shell logcat -s RADV_CHURN:I */
+   AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_CHURN",
+                       "[BO_CHURN] ev=%u creates=%u destroys=%u live=%d allocMB=%" PRIu64 " liveMB=%" PRIu64
+                       " gttMB=%" PRIu64 " evict=%" PRIu64 " movedMB=%" PRIu64
+                       " last64_in=%.1fms (%.0f events/s ~= flushes/s)",
+                       ev, nc, nd, (int)nc - (int)nd, bytes_created >> 20, live_bytes >> 20, gtt_usage >> 20,
+                       evictions, moved >> 20, dt / 1e6, dt ? 64.0 / (dt / 1e9) : 0.0);
+   AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_CHURN",
+                       "[BO_SIZES] %s=%u %s=%u %s=%u %s=%u %s=%u %s=%u %s=%u %s=%u",
+                       radv_xclipse_bo_hist_name[0], radv_xclipse_bo_hist[0],
+                       radv_xclipse_bo_hist_name[1], radv_xclipse_bo_hist[1],
+                       radv_xclipse_bo_hist_name[2], radv_xclipse_bo_hist[2],
+                       radv_xclipse_bo_hist_name[3], radv_xclipse_bo_hist[3],
+                       radv_xclipse_bo_hist_name[4], radv_xclipse_bo_hist[4],
+                       radv_xclipse_bo_hist_name[5], radv_xclipse_bo_hist[5],
+                       radv_xclipse_bo_hist_name[6], radv_xclipse_bo_hist[6],
+                       radv_xclipse_bo_hist_name[7], radv_xclipse_bo_hist[7]);
+}
+
+/* Memory guard: the sgpu kernel hard-locks the phone when GPU-pinned GTT across all processes
+ * reaches ~9-10GB (vendor ICD too). Allocations of 2 MB or more fail with OUT_OF_DEVICE_MEMORY
+ * once the total would pass the advertised 8 GB heap. Usage comes from mem_info_gtt_used, or a
+ * process-local total if that is unreadable. Heap sizes stay honest. */
+#define XCLIPSE_MEMGUARD_SYSFS "/sys/devices/platform/16e00000.sgpu/mem_info_gtt_used"
+#define XCLIPSE_MEMGUARD_LIMIT (8192ull << 20)
+
+static bool
+xclipse_memguard_reject(struct radv_amdgpu_winsys *ws, uint64_t size)
+{
+   if (!ws->info.gfx11_shader_core || size < (2ull << 20))
+      return false;
+
+   static int sysfs_ok = -1;
+   uint64_t used = 0;
+   if (sysfs_ok != 0) {
+      FILE *f = fopen(XCLIPSE_MEMGUARD_SYSFS, "r");
+      if (f) {
+         sysfs_ok = fscanf(f, "%" PRIu64, &used) == 1;
+         fclose(f);
+      } else {
+         sysfs_ok = 0;
+      }
+   }
+   if (sysfs_ok != 1)
+      used = p_atomic_read(&ws->alloc_tracker->allocated_gtt);
+
+   if (used + size > XCLIPSE_MEMGUARD_LIMIT) {
+      radv_log_msg("[MEMGUARD] REJECT alloc %" PRIu64 "MB: gtt_used=%" PRIu64 "MB limit=%" PRIu64 "MB (src=%s)",
+                   size >> 20, used >> 20, XCLIPSE_MEMGUARD_LIMIT >> 20, sysfs_ok == 1 ? "sysfs" : "local");
+      return true;
+   }
+   return false;
+}
+
+/* Winsys-local bo_flags bit (never leaves this file): PAL-style VA map, R|W|X and no MTYPE (0xe).
+ * Imported BOs on 0x73a0 get it. */
+#define RADV_XCLIPSE_VA_MTYPE_DEFAULT (1u << 31)
+
+/* MTYPE for every VA map: 0..5 forces one, -1 = upstream. Default 0 (PAL) on 0x73a0 only.
+ * Env first, then Android property. */
+static int
+radv_xclipse_mtype(struct radv_amdgpu_winsys *ws)
+{
+   static int mt = -2; /* not sampled yet */
+   if (mt != -2)
+      return mt;
+
+   const char *e = getenv("RADV_XCLIPSE_MTYPE");
+   const char *src = e ? "env" : "default";
+   int v = e ? atoi(e) : -1;
+
+#ifdef __ANDROID__
+   if (!e) {
+      char pbuf[PROP_VALUE_MAX] = {0};
+      if (__system_property_get("debug.radv_xclipse_mtype", pbuf) > 0 && pbuf[0]) {
+         v = atoi(pbuf);
+         src = "prop";
+      }
+   }
+#endif
+
+   if (v < 0 && ws->info.pci_id == 0x73a0) {
+      v = 0; /* PAL parity on our chip */
+      if (!e)
+         src = "default(0x73a0 PAL parity)";
+   }
+   if (v > 5)
+      v = -1;
+   mt = v;
+
+   /* Log both arms. */
+   static const char *const names[] = {"none/PAL", "NC", "WC", "CC", "UC", "RW"};
+   AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_ARM", "[ARM] mtype=%d (%s) -- VA maps get %s",
+                       mt, src, mt >= 0 ? names[mt] : "upstream (CC on GFX9+, UC on GL2_BYPASS)");
+   return mt;
+}
 
 static int
 radv_amdgpu_bo_va_op(struct radv_amdgpu_winsys *ws, uint32_t bo_handle, uint64_t offset, uint64_t size, uint64_t addr,
@@ -40,8 +214,24 @@ radv_amdgpu_bo_va_op(struct radv_amdgpu_winsys *ws, uint32_t bo_handle, uint64_t
    if (bo_handle) {
       flags = AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_EXECUTABLE;
 
-      if ((bo_flags & RADEON_FLAG_GL2_BYPASS) && ws->info.gfx_level >= GFX9)
+      /* PAL maps every buffer with flags 0xe (R|W|X, no MTYPE). MTYPE_CC made no difference on
+       * any test (identical results and framebuffer hashes), so the default matches PAL.
+       * Untested: concurrent CPU/GPU access to persistent mappings. CC on GFX9+ is upstream.
+       *   RADV_XCLIPSE_MTYPE / debug.radv_xclipse_mtype
+       *   0=none (default on 0x73a0)  1=NC  2=WC  3=CC (upstream)  4=UC  5=RW;  -1/unset elsewhere
+       */
+      const int mt = radv_xclipse_mtype(ws);
+      if (mt >= 0) {
+         static const uint64_t mtv[] = {0, AMDGPU_VM_MTYPE_NC, AMDGPU_VM_MTYPE_WC,
+                                        AMDGPU_VM_MTYPE_CC, AMDGPU_VM_MTYPE_UC, AMDGPU_VM_MTYPE_RW};
+         flags |= mtv[mt];
+      } else if (bo_flags & RADV_XCLIPSE_VA_MTYPE_DEFAULT) {
+         /* PAL maps imported gralloc/scanout buffers with no MTYPE bits (0x0e vs RADV's 0x6e). */
+      } else if ((bo_flags & RADEON_FLAG_GL2_BYPASS) && ws->info.gfx_level >= GFX9) {
          flags |= AMDGPU_VM_MTYPE_UC;
+      } else if (ws->info.gfx_level >= GFX9) {
+         flags |= AMDGPU_VM_MTYPE_CC;
+      }
 
       if (!(bo_flags & RADEON_FLAG_READ_ONLY))
          flags |= AMDGPU_VM_PAGE_WRITEABLE;
@@ -364,13 +554,180 @@ radv_amdgpu_winsys_virtual_bo_destroy(struct radeon_winsys *_ws, struct radeon_w
    FREE(bo);
 }
 
+/* IB / command BO reuse cache.
+ *
+ * Plain GTT BOs never reach amdgpu_gart_bind() (lpfn = 0), so they cost no TLB flush. IBs do:
+ * amdgpu_cs_find_mapping() -> amdgpu_ttm_alloc_gart() binds them, and that bind (and the unbind on
+ * destroy) runs the raw MMIO ENG17 flush. amdgpu_ttm_alloc_gart() returns early when the BO already
+ * has a GART address, so a reused IB BO costs no flush.
+ *
+ * It creates nothing up front; it only declines to destroy.
+ * Scope: RADEON_FLAG_XCLIPSE_CACHEABLE + NO_INTERPROCESS_SHARING only; never sparse, replayable,
+ * imported or exported.
+ */
+#define RADV_XCLIPSE_IBCACHE_BUCKETS 64
+#define RADV_XCLIPSE_IBCACHE_CAP (64ull << 20)
+
+struct radv_xclipse_ibcache_entry {
+   struct radv_amdgpu_winsys_bo *bo;
+   struct radv_amdgpu_winsys *ws;
+   uint64_t size;
+   unsigned alignment;
+   uint32_t flags;
+   enum radeon_bo_domain domain;
+};
+
+static simple_mtx_t radv_xclipse_ibcache_lock = SIMPLE_MTX_INITIALIZER;
+static struct radv_xclipse_ibcache_entry radv_xclipse_ibcache[RADV_XCLIPSE_IBCACHE_BUCKETS];
+static unsigned radv_xclipse_ibcache_count;
+static uint64_t radv_xclipse_ibcache_bytes;
+/* Winsys being torn down, or NULL. park() refuses its BOs. */
+static struct radv_amdgpu_winsys *radv_xclipse_ibcache_dying;
+
+/* Is this BO safe to keep alive and hand back later? */
+static bool
+radv_xclipse_ibcache_cacheable(const struct radv_amdgpu_winsys_bo *bo)
+{
+   if (bo->base.is_virtual || bo->base.imported)
+      return false;
+   /* Shared BOs live in more than one VM. */
+   if (!(bo->flags & RADEON_FLAG_NO_INTERPROCESS_SHARING))
+      return false;
+   /* Only the classes tagged as cacheable. */
+   if (!(bo->flags & RADEON_FLAG_XCLIPSE_CACHEABLE))
+      return false;
+   if (bo->flags & (RADEON_FLAG_VIRTUAL | RADEON_FLAG_REPLAYABLE))
+      return false;
+   if (bo->emulate_sparse_residency)
+      return false;
+   return true;
+}
+
+/* Destroy path: park instead of freeing. Returns true if the cache took the BO.
+ * The kernel BO, VA mapping and GART binding stay intact, so trackers are not decremented. */
+static bool
+radv_xclipse_ibcache_park(struct radv_amdgpu_winsys *ws, struct radv_amdgpu_winsys_bo *bo, unsigned alignment)
+{
+   if (!radv_xclipse_ibcache_cacheable(bo))
+      return false;
+
+   simple_mtx_lock(&radv_xclipse_ibcache_lock);
+   if (ws == radv_xclipse_ibcache_dying) {
+      simple_mtx_unlock(&radv_xclipse_ibcache_lock);
+      return false;
+   }
+   if (radv_xclipse_ibcache_count >= RADV_XCLIPSE_IBCACHE_BUCKETS ||
+       radv_xclipse_ibcache_bytes + bo->base.size > RADV_XCLIPSE_IBCACHE_CAP) {
+      simple_mtx_unlock(&radv_xclipse_ibcache_lock);
+      return false;
+   }
+
+   /* Drop the CPU mapping so buffer_map() sees a fresh BO. munmap does not touch the GART binding. */
+   if (bo->cpu_map) {
+      munmap(bo->cpu_map, bo->base.size);
+      bo->cpu_map = NULL;
+   }
+
+   struct radv_xclipse_ibcache_entry *e = &radv_xclipse_ibcache[radv_xclipse_ibcache_count++];
+   e->bo = bo;
+   e->ws = ws;
+   e->size = bo->base.size;
+   e->alignment = alignment;
+   e->flags = bo->flags;
+   e->domain = bo->base.initial_domain;
+   radv_xclipse_ibcache_bytes += bo->base.size;
+   simple_mtx_unlock(&radv_xclipse_ibcache_lock);
+   return true;
+}
+
+/* Create path: return an exact match (size, alignment, flags, domain) or NULL. */
+static struct radv_amdgpu_winsys_bo *
+radv_xclipse_ibcache_reuse(struct radv_amdgpu_winsys *ws, uint64_t size, unsigned alignment,
+                           enum radeon_bo_domain domain, uint32_t flags)
+{
+   if (!(flags & RADEON_FLAG_XCLIPSE_CACHEABLE) || !(flags & RADEON_FLAG_NO_INTERPROCESS_SHARING))
+      return NULL;
+
+   /* Normalise the domain like bo_create (VRAM->GTT): park() records the post-downgrade domain. */
+   if (ws->info.vram_size_kb == 0 && (domain & RADEON_DOMAIN_VRAM))
+      domain = (domain & ~RADEON_DOMAIN_VRAM) | RADEON_DOMAIN_GTT;
+
+   struct radv_amdgpu_winsys_bo *bo = NULL;
+   simple_mtx_lock(&radv_xclipse_ibcache_lock);
+   for (unsigned i = 0; i < radv_xclipse_ibcache_count; i++) {
+      struct radv_xclipse_ibcache_entry *e = &radv_xclipse_ibcache[i];
+      if (e->ws != ws || e->size != size || e->alignment != alignment || e->flags != flags || e->domain != domain)
+         continue;
+      bo = e->bo;
+      radv_xclipse_ibcache_bytes -= e->size;
+      radv_xclipse_ibcache[i] = radv_xclipse_ibcache[--radv_xclipse_ibcache_count];
+      break;
+   }
+   simple_mtx_unlock(&radv_xclipse_ibcache_lock);
+   return bo;
+}
+
+static void radv_amdgpu_winsys_bo_destroy(struct radeon_winsys *_ws, struct radeon_winsys_bo *_bo);
+
+/* Free every BO a winsys parked when it is destroyed. Entries are keyed on the winsys pointer; a
+ * new winsys at the same address would otherwise get BOs with stale GEM handles from a closed fd. */
+static void
+radv_xclipse_ibcache_purge_ws(struct radv_amdgpu_winsys *ws)
+{
+   for (;;) {
+      struct radv_amdgpu_winsys_bo *bo = NULL;
+      simple_mtx_lock(&radv_xclipse_ibcache_lock);
+      for (unsigned i = 0; i < radv_xclipse_ibcache_count; i++) {
+         if (radv_xclipse_ibcache[i].ws != ws)
+            continue;
+         bo = radv_xclipse_ibcache[i].bo;
+         radv_xclipse_ibcache_bytes -= radv_xclipse_ibcache[i].size;
+         radv_xclipse_ibcache[i] = radv_xclipse_ibcache[--radv_xclipse_ibcache_count];
+         break;
+      }
+      simple_mtx_unlock(&radv_xclipse_ibcache_lock);
+      if (!bo)
+         return;
+      radv_amdgpu_winsys_bo_destroy(&ws->base, &bo->base); /* park() refuses: ws is dying */
+   }
+}
+
+/* First thing in radv_amdgpu_winsys_destroy(): stop parking this winsys' BOs and free them. */
+void
+radv_xclipse_ibcache_winsys_begin_destroy(struct radv_amdgpu_winsys *ws)
+{
+   simple_mtx_lock(&radv_xclipse_ibcache_lock);
+   radv_xclipse_ibcache_dying = ws;
+   simple_mtx_unlock(&radv_xclipse_ibcache_lock);
+   radv_xclipse_ibcache_purge_ws(ws);
+}
+
+/* Before the winsys' device goes away: check nothing is left, then clear the marker. */
+void
+radv_xclipse_ibcache_winsys_end_destroy(struct radv_amdgpu_winsys *ws)
+{
+   radv_xclipse_ibcache_purge_ws(ws);
+   simple_mtx_lock(&radv_xclipse_ibcache_lock);
+   if (radv_xclipse_ibcache_dying == ws)
+      radv_xclipse_ibcache_dying = NULL;
+   simple_mtx_unlock(&radv_xclipse_ibcache_lock);
+}
+
 static void
 radv_amdgpu_winsys_bo_destroy(struct radeon_winsys *_ws, struct radeon_winsys_bo *_bo)
 {
    struct radv_amdgpu_winsys *ws = radv_amdgpu_winsys(_ws);
    struct radv_amdgpu_winsys_bo *bo = radv_amdgpu_winsys_bo(_bo);
 
+   /* Park an IB/command BO instead of destroying it. Before churn accounting, so [BO_CHURN] still
+    * counts only real kernel create/destroy events. */
+   if (radv_xclipse_ibcache_park(ws, bo, bo->xclipse_alignment))
+      return;
+
    radv_amdgpu_log_bo(ws, bo, true);
+   /* Only un-count what was counted: imports never passed through the allocate path. */
+   if (bo->churn_counted)
+      radv_xclipse_bo_churn(ws, bo->base.size, false);
 
    if (bo->base.is_virtual) {
       radv_amdgpu_winsys_virtual_bo_destroy(_ws, _bo);
@@ -474,6 +831,10 @@ radv_amdgpu_winsys_virtual_bo_create(struct radeon_winsys *_ws, uint64_t size, u
       goto error_va_alloc;
    }
 
+   /* RADEON_FLAG_32BIT BOs are reached through a 32-bit SH register completed with address32_hi.
+    * libdrm silently falls back to the general range when the 4 GiB window is full; catch it here. */
+   if ((flags & RADEON_FLAG_32BIT) && va && (uint32_t)(va >> 32) != ws->info.address32_hi)
+      ac_xclipse_va32_violation(va, ws->info.address32_hi);
    bo->base.va = va;
    bo->base.size = size;
    bo->va_handle = va_handle;
@@ -532,6 +893,20 @@ radv_amdgpu_winsys_bo_create(struct radeon_winsys *_ws, uint64_t size, unsigned 
     */
    *out_bo = NULL;
 
+   if (xclipse_memguard_reject(ws, size))
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   /* Reuse a parked exact match: still GART-bound, so the next submit costs no flush. No churn
+    * accounting: no kernel BO was created. */
+   if (!replay_address) {
+      struct radv_amdgpu_winsys_bo *reused = radv_xclipse_ibcache_reuse(ws, size, alignment, initial_domain, flags);
+      if (reused) {
+         reused->priority = priority;
+         *out_bo = &reused->base;
+         return VK_SUCCESS;
+      }
+   }
+
    bo = CALLOC_STRUCT(radv_amdgpu_winsys_bo);
    if (!bo) {
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -555,12 +930,23 @@ radv_amdgpu_winsys_bo_create(struct radeon_winsys *_ws, uint64_t size, unsigned 
       goto error_va_alloc;
    }
 
+   /* Same check as the sparse path: a 32BIT BO served from the general range. */
+   if ((flags & RADEON_FLAG_32BIT) && va && (uint32_t)(va >> 32) != ws->info.address32_hi)
+      ac_xclipse_va32_violation(va, ws->info.address32_hi);
    bo->base.va = va;
    bo->base.size = size;
    bo->va_handle = va_handle;
 
    request.alloc_size = size;
    request.phys_alignment = alignment;
+
+   if (ws->info.vram_size_kb == 0 &&
+       initial_domain & RADEON_DOMAIN_VRAM) {
+      /* Xclipse 920 reports dedicated VRAM for the heap topology but has none. Downgrade VRAM to
+       * GTT, or shader code written via memcpy() sits in a mapping the GPU fetch can't see.
+       */
+      initial_domain = (initial_domain & ~RADEON_DOMAIN_VRAM) | RADEON_DOMAIN_GTT;
+   }
 
    if (initial_domain & RADEON_DOMAIN_VRAM) {
       request.preferred_heap |= AMDGPU_GEM_DOMAIN_VRAM;
@@ -615,7 +1001,9 @@ radv_amdgpu_winsys_bo_create(struct radeon_winsys *_ws, uint64_t size, unsigned 
          request.flags |= AMDGPU_GEM_CREATE_VRAM_CLEARED;
    }
 
-   if (flags & RADEON_FLAG_DISCARDABLE)
+   /* AMDGPU_GEM_CREATE_DISCARDABLE needs DRM 3.47; older kernels reject unknown flags with -EINVAL.
+    * Samsung's sgpu kernel is DRM 3.42. The gallium winsys has the same gate. */
+   if (flags & RADEON_FLAG_DISCARDABLE && ws->info.drm_minor >= 47)
       request.flags |= AMDGPU_GEM_CREATE_DISCARDABLE;
 
    if (flags & RADEON_FLAG_GFX12_ALLOW_DCC && ws->info.drm_minor >= 58) {
@@ -660,6 +1048,9 @@ radv_amdgpu_winsys_bo_create(struct radeon_winsys *_ws, uint64_t size, unsigned 
       }
    }
 
+   radv_xclipse_bo_churn(ws, size, true);
+   bo->churn_counted = true;
+
    bo->bo = buf_handle;
    bo->bo_handle = kms_handle;
    bo->base.initial_domain = initial_domain;
@@ -668,6 +1059,7 @@ radv_amdgpu_winsys_bo_create(struct radeon_winsys *_ws, uint64_t size, unsigned 
    bo->cpu_map = NULL;
    bo->base.obj_id = (uintptr_t)(buf_handle.abo);
    bo->flags = flags;
+   bo->xclipse_alignment = alignment; /* matched by the IB reuse cache */
 
    if (initial_domain & RADEON_DOMAIN_VRAM) {
       /* Buffers allocated in VRAM with the NO_CPU_ACCESS flag
@@ -850,6 +1242,7 @@ radv_amdgpu_winsys_bo_from_ptr(struct radeon_winsys *_ws, void *pointer, uint64_
    bo->bo_handle = kms_handle;
    bo->base.initial_domain = RADEON_DOMAIN_GTT;
    bo->base.use_global_list = false;
+   bo->base.imported = true;
    bo->priority = priority;
    bo->cpu_map = NULL;
    bo->base.obj_id = (uintptr_t)(buf_handle.abo);
@@ -924,7 +1317,8 @@ radv_amdgpu_winsys_bo_from_fd(struct radeon_winsys *_ws, int fd, unsigned priori
       goto error_query;
    }
 
-   r = radv_amdgpu_bo_va_op(ws, kms_handle, 0, result.alloc_size, va, 0, 0, AMDGPU_VA_OP_MAP);
+   const uint32_t import_va_flags = ws->info.pci_id == 0x73a0 ? RADV_XCLIPSE_VA_MTYPE_DEFAULT : 0;
+   r = radv_amdgpu_bo_va_op(ws, kms_handle, 0, result.alloc_size, va, import_va_flags, 0, AMDGPU_VA_OP_MAP);
    if (r) {
       vk_result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
       goto error_va_map;
@@ -944,7 +1338,15 @@ radv_amdgpu_winsys_bo_from_fd(struct radeon_winsys *_ws, int fd, unsigned priori
    bo->base.initial_domain = initial;
    bo->base.use_global_list = false;
    bo->base.size = result.alloc_size;
+   bo->base.imported = true;
    bo->priority = priority;
+
+   /* Treat imported dma-bufs as resident and never list them per submit, like the vendor driver.
+    * Listing them made the kernel bind them at submit, and the cold bind's ENG17 flush reset the
+    * phone. is_local makes make_resident return early and radv_cs_add_buffer skip it. */
+   if (ws->info.pci_id == 0x73a0)
+      bo->base.is_local = true;
+
    bo->cpu_map = NULL;
    bo->base.obj_id = (uintptr_t)(result.bo.abo);
 
@@ -1152,6 +1554,9 @@ radv_amdgpu_winsys_bo_set_metadata(struct radeon_winsys *_ws, struct radeon_wins
    metadata.size_metadata = md->size_metadata;
    memcpy(metadata.umd_metadata, md->metadata, sizeof(md->metadata));
 
+   RADV_LOGI("[BO_SET_META] tiling_flags=0x%016llx size_meta=%u umd_meta[0]=0x%08x",
+             (unsigned long long)tiling_flags, metadata.size_metadata, metadata.umd_metadata[0]);
+
    ac_drm_bo_set_metadata(ws->dev, bo->bo_handle, &metadata);
 }
 
@@ -1221,6 +1626,7 @@ radv_amdgpu_winsys_bo_make_resident(struct radeon_winsys *_ws, struct radeon_win
       return VK_SUCCESS;
 
    if (resident) {
+      /* Imports are is_local (from_fd), so only non-resident BOs reach this path. */
       result = radv_amdgpu_global_bo_list_add(ws, bo);
    } else {
       radv_amdgpu_global_bo_list_del(ws, bo);

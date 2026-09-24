@@ -76,6 +76,21 @@ struct radv_amdgpu_winsys {
       struct radeon_winsys_bo *bo;
       simple_mtx_t lock;
    } null_prt_bug;
+
+   /* Command-buffer IB cache, like PAL's CmdAllocator. With no SDMA and no VRAM, every GART bind
+    * and unbind runs the raw MMIO ENG17 flush, and RADV freed chained IBs on every per-frame reset.
+    * Recycles IB BOs instead. Entries come back only from cs_reset/cs_destroy (never pending).
+    * Exact-size buckets. */
+   struct {
+      simple_mtx_t lock;
+      struct {
+         struct radeon_winsys_bo *bo;
+         uint32_t size;
+      } entries[64];
+      uint32_t count;
+      /* hits/misses feed the [IB_CACHE] log line */
+      uint32_t hits, misses, returns;
+   } ib_cache;
 };
 
 static inline struct radv_amdgpu_winsys *
