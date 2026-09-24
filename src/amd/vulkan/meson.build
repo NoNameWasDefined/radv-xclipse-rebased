@@ -74,6 +74,7 @@ libradv_files = files(
   'meta/radv_meta.c',
   'meta/radv_meta.h',
   'meta/radv_meta_astc_decode.c',
+  'meta/radv_meta_bc_decode.c',
   'meta/radv_meta_blit.c',
   'meta/radv_meta_blit2d.c',
   'meta/radv_meta_buffer.c',
@@ -111,6 +112,9 @@ libradv_files = files(
   'nir/radv_nir_lower_primitive_shading_rate.c',
   'nir/radv_nir_lower_printf.c',
   'nir/radv_nir_lower_ray_queries.c',
+  'nir/radv_nir_lower_passthrough_gs.c',
+  'nir/radv_nir_lower_viewport_mask.c',
+  'nir/radv_nir_lower_viewport_swizzle.c',
   'nir/radv_nir_lower_vs_inputs.c',
   'nir/radv_nir_opt_fs_builtins.c',
   'nir/radv_nir_opt_tid_function.c',
@@ -195,6 +199,8 @@ libradv_files = files(
   'radv_pipeline_rt.c',
   'radv_pipeline_rt.h',
   'radv_queue.c',
+  'radv_xclipse_prof.c',
+  'radv_xclipse_prof.h',
   'radv_queue.h',
   'radv_radeon_winsys.h',
   'radv_sampler.c',
@@ -242,6 +248,24 @@ endif
 subdir('bvh')
 
 subdir('layers')
+
+# GPU decoders for the BC formats the texture unit may lack (BC4/BC5/BC6H/BC7).
+# One variant per decoded-plane format; see radv_meta_bc_decode.c.
+radv_bc_decoder_spv = []
+foreach v : [['unorm8', 'BC_OUT_UNORM8'], ['snorm8', 'BC_OUT_SNORM8'], ['f16', 'BC_OUT_F16'],
+             ['u32x4', 'BC_OUT_U32X4'], ['eac', 'BC_OUT_EAC'], ['bc3', 'BC_OUT_BC3']]
+  radv_bc_decoder_spv += custom_target(
+    'bc_decoder_@0@_spv.h'.format(v[0]),
+    input : bc_decoder_glsl_file,
+    output : 'bc_decoder_@0@_spv.h'.format(v[0]),
+    command : [
+      prog_glslang, '-V', '-S', 'comp', '-x', '-D@0@'.format(v[1]),
+      '-o', '@OUTPUT@', '@INPUT@', glslang_quiet, glslang_depfile,
+    ],
+    depfile : 'bc_decoder_@0@_spv.h.d'.format(v[0]),
+  )
+endforeach
+libradv_files += radv_bc_decoder_spv
 
 radv_deps = []
 radv_flags = cc.get_supported_arguments(['-Wimplicit-fallthrough', '-Wshadow'])

@@ -15,6 +15,7 @@
 #include "radv_buffer.h"
 #include "radv_entrypoints.h"
 #include "radv_image.h"
+#include "radv_logcat.h"
 
 #include "vk_debug_utils.h"
 #include "vk_log.h"
@@ -198,6 +199,13 @@ radv_alloc_memory(struct radv_device *device, const VkMemoryAllocateInfo *pAlloc
          }
          goto fail;
       }
+
+      /* Log all BO allocations. Do not add free-side logging here (coincided with phone crashes at
+       * Winlator compositor startup). */
+      RADV_LOGI("[ALLOC_MEM] alloc_size=%llu domain=%u flags=0x%x memType=%u gfx=%u dedicated=%d",
+                (unsigned long long)alloc_size, domain, flags,
+                pAllocateInfo->memoryTypeIndex, pdev->info.gfx_level,
+                (mem->image != NULL) || (mem->buffer != NULL));
 
       if (flags & RADEON_FLAG_GFX12_ALLOW_DCC) {
          if (mem->image) {

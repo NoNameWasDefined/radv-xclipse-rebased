@@ -99,6 +99,7 @@ amd_common_files = files(
   'ac_binary.c',
   'ac_binary.h',
   'ac_cmdbuf.c',
+  'radv_log_helper.c',
   'ac_cmdbuf.h',
   'ac_cmdbuf_base.h',
   'ac_cmdbuf_cp.c',
@@ -228,6 +229,8 @@ if dep_elf.found()
     'ac_rtld.h',
     'ac_rgp_elf_object_pack.c',
   )
+else
+  amd_common_files += files('ac_rtld_stub.c')
 endif
 
 idep_amd_generated_headers = declare_dependency(

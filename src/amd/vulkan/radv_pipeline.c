@@ -439,6 +439,9 @@ radv_postprocess_nir(const struct radv_compiler_info *compiler_info, const struc
       ac_nir_lower_ps_late_options late_options = {
          .gfx_level = gfx_level,
          .use_aco = !use_llvm,
+         /* Xclipse 920: packed exports use GFX11 conventions (per-VGPR enable mask, no COMPR); a
+          * COMPR export is dropped. */
+         .gfx11_export_conventions = compiler_info->hw.gfx11_isa,
          .bc_optimize_for_persp = G_0286CC_PERSP_CENTER_ENA(stage->info.ps.spi_ps_input_ena) &&
                                   G_0286CC_PERSP_CENTROID_ENA(stage->info.ps.spi_ps_input_ena),
          .bc_optimize_for_linear = G_0286CC_LINEAR_CENTER_ENA(stage->info.ps.spi_ps_input_ena) &&
