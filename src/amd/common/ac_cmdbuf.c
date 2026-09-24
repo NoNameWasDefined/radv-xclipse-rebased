@@ -6,6 +6,7 @@
  */
 
 #include "ac_cmdbuf.h"
+#include "ac_xclipse_log.h"
 #include "ac_pm4.h"
 #include "ac_shader_util.h"
 
@@ -13,7 +14,89 @@
 
 #include "util/u_math.h"
 
+#include "radv_logcat.h"
+
+#include <stdlib.h>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
+
 #define SI_GS_PER_ES 128
+
+/* Knob source resolution: env var first, then system property. An env var counts only if present
+ * and numeric: launchers export empty RADV_* vars, and getenv() != NULL would read 0 and skip the
+ * property. Reports which source won. */
+static int
+xclipse_knob(const char *env_name, const char *prop_name, const char **src_out)
+{
+   const char *why_not_env = NULL;   /* set when an env var was present but unusable */
+   const char *e = getenv(env_name);
+
+   if (e && e[0]) {
+      char *end = NULL;
+      long l = strtol(e, &end, 10);
+      if (end && end != e && *end == '\0') {
+         *src_out = "env";
+         return (int)l;
+      }
+      /* Present but not a number -- deliberately IGNORED rather than silently taken as 0. */
+      why_not_env = "env-invalid->prop";
+   } else if (e) {
+      why_not_env = "env-empty->prop";
+   }
+
+#ifdef __ANDROID__
+   {
+      char v[92] = {0};
+      if (__system_property_get(prop_name, v) > 0 && v[0]) {
+         *src_out = why_not_env ? why_not_env : "prop";
+         return atoi(v);
+      }
+   }
+#endif
+
+   *src_out = why_not_env ? why_not_env : "default";
+   return 0;
+}
+
+/* Property-readable so it can be armed for an APK, which cannot be given an env var:
+   `setprop debug.radv_xclipse_runcheck 1`. Run it with a real game: that is where the split-run
+   list that matters comes from. */
+int
+ac_xclipse_runcheck(void)
+{
+   static int cached = -1;
+   if (cached == -1) {
+      const char *src = "default";
+      cached = xclipse_knob("RADV_XCLIPSE_RUNCHECK", "debug.radv_xclipse_runcheck", &src);
+   }
+   return cached;
+}
+
+/* Reports the first few violations with addresses, then only counts (per-draw path). Never
+ * aborts. */
+void
+ac_xclipse_va32_violation(uint64_t va, uint32_t address32_hi)
+{
+   static unsigned n;
+   const unsigned i = n++;
+#ifdef __ANDROID__
+   if (i < 8)
+      AC_XCLIPSE_LOGP(ANDROID_LOG_ERROR, "RADV_ARM",
+                          "[ARM] VA32 VIOLATION #%u: va=0x%llx -- the shader completes this "
+                          "pointer with address32_hi=0x%08x, so it will read 0x%08x%08x instead. "
+                          "That is a DIFFERENT LIVE BO.",
+                          i, (unsigned long long)va, address32_hi, address32_hi,
+                          (uint32_t)(va & 0xffffffffu));
+   else if (i == 8)
+      AC_XCLIPSE_LOGP(ANDROID_LOG_ERROR, "RADV_ARM",
+                          "[ARM] VA32 VIOLATION: further occurrences suppressed");
+#else
+   (void)i;
+   (void)va;
+   (void)address32_hi;
+#endif
+}
 
 static void
 gfx6_init_compute_preamble_state(const struct ac_preamble_state *state,
@@ -56,10 +139,19 @@ gfx10_init_compute_preamble_state(const struct ac_preamble_state *state,
    const uint32_t compute_cu_en = S_00B858_SH0_CU_EN(info->spi_cu_en) |
                                   S_00B858_SH1_CU_EN(info->spi_cu_en);
 
+   RADV_LOGI("[COMPUTE PREAMBLE] gfx_level=%u family=%u border_color_va=0x%llx address32_hi=0x%x max_se=%u",
+             info->gfx_level, info->family,
+             (unsigned long long)state->border_color_va, info->address32_hi, info->max_se);
+
    if (info->gfx_level < GFX11)
       ac_pm4_set_reg(pm4, R_0301EC_CP_COHER_START_DELAY, 0x20);
    ac_pm4_set_reg(pm4, R_030E00_TA_CS_BC_BASE_ADDR, state->border_color_va >> 8);
    ac_pm4_set_reg(pm4, R_030E04_TA_CS_BC_BASE_ADDR_HI, S_030E04_ADDRESS(state->border_color_va >> 40));
+
+   RADV_LOGI("[COMPUTE PREAMBLE] TA_CS_BC_BASE_ADDR=0x%llx (>>8=%llu) TA_CS_BC_BASE_ADDR_HI=0x%x",
+             (unsigned long long)state->border_color_va,
+             (unsigned long long)(state->border_color_va >> 8),
+             S_030E04_ADDRESS(state->border_color_va >> 40));
 
    ac_pm4_set_reg(pm4, R_00B834_COMPUTE_PGM_HI, S_00B834_DATA(info->address32_hi >> 8));
 
@@ -398,6 +490,12 @@ gfx10_init_graphics_preamble_state(const struct ac_preamble_state *state,
    unsigned cache_no_alloc = info->gfx_level >= GFX11 ? V_02807C_CACHE_NOA_GFX11:
                                                         V_02807C_CACHE_NOA_GFX10;
 
+   RADV_LOGI("[GFX PREAMBLE] gfx_level=%u family=%u border_color_va=0x%llx cache_cb_gl2=%d cache_db_gl2=%d max_render_backends=%u",
+             info->gfx_level, info->family,
+             (unsigned long long)state->border_color_va,
+             state->gfx10.cache_cb_gl2, state->gfx10.cache_db_gl2,
+             info->max_render_backends);
+
    if (state->gfx10.cache_cb_gl2) {
       color_write_policy = V_028410_CACHE_LRU_WR;
       color_read_policy = V_028410_CACHE_LRU_RD;
@@ -514,22 +612,24 @@ gfx10_init_graphics_preamble_state(const struct ac_preamble_state *state,
       ac_pm4_set_reg(pm4, R_028C40_PA_SC_SHADER_CONTROL, 0);
    }
 
-   if (info->gfx_level < GFX11) {
+   /* 0x00e is DB_HTILE_DATA_BASE on TITAN. */
+   if (info->gfx_level < GFX11 && !ac_titan_db_active()) {
       ac_pm4_set_reg(pm4, R_028038_DB_DFSM_CONTROL, S_028038_PUNCHOUT_MODE(V_028038_FORCE_OFF));
    }
 
-   ac_pm4_set_reg(pm4, R_02807C_DB_RMI_L2_CACHE_CONTROL,
+   uint32_t db_rmi_val =
                   S_02807C_Z_WR_POLICY(zs_write_policy) |
                   S_02807C_S_WR_POLICY(zs_write_policy) |
                   S_02807C_HTILE_WR_POLICY(htile_write_policy) |
                   S_02807C_ZPCPSD_WR_POLICY(V_02807C_CACHE_STREAM) | /* occlusion query writes */
                   S_02807C_Z_RD_POLICY(zs_read_policy) |
                   S_02807C_S_RD_POLICY(zs_read_policy) |
-                  S_02807C_HTILE_RD_POLICY(htile_read_policy));
+                  S_02807C_HTILE_RD_POLICY(htile_read_policy);
+   ac_pm4_set_reg(pm4, R_02807C_DB_RMI_L2_CACHE_CONTROL, db_rmi_val);
    ac_pm4_set_reg(pm4, R_028080_TA_BC_BASE_ADDR, state->border_color_va >> 8);
    ac_pm4_set_reg(pm4, R_028084_TA_BC_BASE_ADDR_HI, S_028084_ADDRESS(state->border_color_va >> 40));
 
-   ac_pm4_set_reg(pm4, R_028410_CB_RMI_GL2_CACHE_CONTROL,
+   uint32_t cb_rmi_val =
                   (info->gfx_level >= GFX11 ?
                       S_028410_COLOR_WR_POLICY_GFX11(color_write_policy) |
                       S_028410_COLOR_RD_POLICY(color_read_policy) |
@@ -543,7 +643,17 @@ gfx10_init_graphics_preamble_state(const struct ac_preamble_state *state,
                       S_028410_CMASK_WR_POLICY(dcc_write_policy) |
                       S_028410_CMASK_RD_POLICY(dcc_read_policy) |
                       S_028410_DCC_WR_POLICY_GFX10(dcc_write_policy) |
-                      S_028410_DCC_RD_POLICY(dcc_read_policy));
+                      S_028410_DCC_RD_POLICY(dcc_read_policy);
+   ac_pm4_set_reg(pm4, R_028410_CB_RMI_GL2_CACHE_CONTROL, cb_rmi_val);
+
+   RADV_LOGI("[GFX PREAMBLE] DB_RMI_L2_CACHE_CONTROL=0x%08x", db_rmi_val);
+   RADV_LOGI("[GFX PREAMBLE] TA_BC_BASE_ADDR=0x%llx (>>8=%llu)",
+             (unsigned long long)state->border_color_va,
+             (unsigned long long)(state->border_color_va >> 8));
+   RADV_LOGI("[GFX PREAMBLE] CB_RMI_GL2_CACHE_CONTROL=0x%08x", cb_rmi_val);
+   RADV_LOGI("[GFX PREAMBLE] color_wr=%u color_rd=%u dcc_wr=%u dcc_rd=%u zs_wr=%u zs_rd=%u",
+             color_write_policy, color_read_policy, dcc_write_policy, dcc_read_policy,
+             zs_write_policy, zs_read_policy);
 
    if (info->gfx_level >= GFX10_3)
       ac_pm4_set_reg(pm4, R_028750_SX_PS_DOWNCONVERT_CONTROL, 0xff);
@@ -613,7 +723,9 @@ gfx10_init_graphics_preamble_state(const struct ac_preamble_state *state,
    ac_pm4_set_reg(pm4, R_030A00_PA_SU_LINE_STIPPLE_VALUE, 0);
    ac_pm4_set_reg(pm4, R_030A04_PA_SC_LINE_STIPPLE_STATE, 0);
 
-   if (info->gfx_level >= GFX11) {
+   /* Xclipse 920: the pixel pipe uses the GFX11 occlusion mechanism (ZPASS_DONE ignored, counters
+    * via PIXEL_PIPE_STAT_CONTROL/DUMP) with the GFX10.3 register interface. */
+   if (info->gfx_level >= GFX11 || info->gfx11_shader_core) {
       uint64_t rb_mask = BITFIELD64_MASK(info->max_render_backends);
 
       ac_pm4_cmd_add(pm4, PKT3(PKT3_EVENT_WRITE, 2, 0));
@@ -669,8 +781,18 @@ gfx12_init_graphics_preamble_state(const struct ac_preamble_state *state,
    /* Shader registers - GS */
    ac_pm4_set_reg(pm4, R_00B218_SPI_SHADER_PGM_HI_ES,
                   S_00B324_MEM_BASE(info->address32_hi >> 8));
-   ac_pm4_set_reg(pm4, R_00B21C_SPI_SHADER_PGM_RSRC3_GS,
-                  ac_apply_cu_en(0xfffffdfd, 0, 0, info));
+   /* Merged stage address high half. GFX10_3 keeps it at 0x00B218, which is PGM_LO on TITAN, so the
+    * high half was never written and shaders above 40 bits launched at a truncated address (compute
+    * writes its LO/HI pair explicitly). On TITAN it goes to 0x00B21C. */
+   if (ac_titan_regmap_level >= 7) {
+      ac_pm4_set_reg(pm4, R_00B21C_SPI_SHADER_PGM_RSRC3_GS,
+                     S_00B324_MEM_BASE(info->address32_hi >> 8));
+   } else if (ac_titan_sh_suppressed(R_00B21C_SPI_SHADER_PGM_RSRC3_GS)) {
+      ac_pm4_set_reg(pm4, R_00B21C_SPI_SHADER_PGM_RSRC3_GS, 0);
+   } else {
+      ac_pm4_set_reg(pm4, R_00B21C_SPI_SHADER_PGM_RSRC3_GS,
+                     ac_apply_cu_en(0xfffffdfd, 0, 0, info));
+   }
    ac_pm4_set_reg(pm4, R_00B2C8_SPI_SHADER_USER_ACCUM_ESGS_0, 0);
    ac_pm4_set_reg(pm4, R_00B2CC_SPI_SHADER_USER_ACCUM_ESGS_1, 0);
    ac_pm4_set_reg(pm4, R_00B2D0_SPI_SHADER_USER_ACCUM_ESGS_2, 0);

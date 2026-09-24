@@ -9,9 +9,11 @@
 #include "ac_gpu_info.h"
 #include "ac_formats.h"
 #include "ac_surface.h"
+#include "ac_titan_regmap.h"
 
 #include "gfx10_format_table.h"
 #include "amdgfxregs.h"
+#include "radv_logcat.h"
 
 #include "util/u_math.h"
 #include "util/format/u_format.h"
@@ -481,12 +483,96 @@ ac_build_gfx6_texture_descriptor(const struct radeon_info *info, const struct ac
    }
 }
 
+/* Xclipse native ASTC. Samsung added a hardware ASTC decoder (IMG_FMT_ASTC_2D_LDR_*) to the texture
+ * unit. Format codes measured from the vendor driver's descriptors (word1 bits [27:20]). Never guess
+ * a T# format: a bad one faults the GPU.
+ */
 static uint32_t
-ac_get_gfx10_img_format(const enum amd_gfx_level gfx_level, const struct ac_texture_state *state)
+ac_xclipse_astc_img_format(enum pipe_format format)
+{
+   switch (format) {
+   /* LDR UNORM: 133..146, in ascending block-size order */
+   case PIPE_FORMAT_ASTC_4x4:        return 133;
+   case PIPE_FORMAT_ASTC_5x4:        return 134;
+   case PIPE_FORMAT_ASTC_5x5:        return 135;
+   case PIPE_FORMAT_ASTC_6x5:        return 136;
+   case PIPE_FORMAT_ASTC_6x6:        return 137;
+   case PIPE_FORMAT_ASTC_8x5:        return 138;
+   case PIPE_FORMAT_ASTC_8x6:        return 139;
+   case PIPE_FORMAT_ASTC_8x8:        return 140;
+   case PIPE_FORMAT_ASTC_10x5:       return 141;
+   case PIPE_FORMAT_ASTC_10x6:       return 142;
+   case PIPE_FORMAT_ASTC_10x8:       return 143;
+   case PIPE_FORMAT_ASTC_10x10:      return 144;
+   case PIPE_FORMAT_ASTC_12x10:      return 145;
+   case PIPE_FORMAT_ASTC_12x12:      return 146;
+   /* LDR sRGB: 161..174, same order */
+   case PIPE_FORMAT_ASTC_4x4_SRGB:   return 161;
+   case PIPE_FORMAT_ASTC_5x4_SRGB:   return 162;
+   case PIPE_FORMAT_ASTC_5x5_SRGB:   return 163;
+   case PIPE_FORMAT_ASTC_6x5_SRGB:   return 164;
+   case PIPE_FORMAT_ASTC_6x6_SRGB:   return 165;
+   case PIPE_FORMAT_ASTC_8x5_SRGB:   return 166;
+   case PIPE_FORMAT_ASTC_8x6_SRGB:   return 167;
+   case PIPE_FORMAT_ASTC_8x8_SRGB:   return 168;
+   case PIPE_FORMAT_ASTC_10x5_SRGB:  return 169;
+   case PIPE_FORMAT_ASTC_10x6_SRGB:  return 170;
+   case PIPE_FORMAT_ASTC_10x8_SRGB:  return 171;
+   case PIPE_FORMAT_ASTC_10x10_SRGB: return 172;
+   case PIPE_FORMAT_ASTC_12x10_SRGB: return 173;
+   case PIPE_FORMAT_ASTC_12x12_SRGB: return 174;
+   default:                          return 0;
+   }
+}
+
+/* Xclipse native ETC2/EAC, measured the same way. Upstream GFX10 has no ETC2 (has_etc_support is
+ * false), but this chip decodes it. Codes 123..132, just below ASTC's 133..146, in AMD's IMG_FORMAT
+ * order (not Vulkan's): RGB, RGB_SRGB, RGBA, RGBA_SRGB, R11, R11_SNORM, RG11, RG11_SNORM, RGBA1,
+ * RGBA1_SRGB.
+ */
+static uint32_t
+ac_xclipse_etc2_img_format(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_ETC1_RGB8:        /* ETC2's RGB decoder decodes ETC1 streams */
+   case PIPE_FORMAT_ETC2_RGB8:        return 123;
+   case PIPE_FORMAT_ETC2_SRGB8:       return 124;
+   case PIPE_FORMAT_ETC2_RGBA8:       return 125;
+   case PIPE_FORMAT_ETC2_SRGBA8:      return 126;
+   case PIPE_FORMAT_ETC2_R11_UNORM:   return 127;
+   case PIPE_FORMAT_ETC2_R11_SNORM:   return 128;
+   case PIPE_FORMAT_ETC2_RG11_UNORM:  return 129;
+   case PIPE_FORMAT_ETC2_RG11_SNORM:  return 130;
+   case PIPE_FORMAT_ETC2_RGB8A1:      return 131;
+   case PIPE_FORMAT_ETC2_SRGB8A1:     return 132;
+   default:                           return 0;
+   }
+}
+
+/* Whether the Xclipse texture unit samples this compressed format natively (ASTC LDR, ETC2/EAC). */
+bool
+ac_xclipse_native_texture_format(const struct radeon_info *info, enum pipe_format format)
+{
+   return info->gfx11_shader_core &&
+          (ac_xclipse_astc_img_format(format) || ac_xclipse_etc2_img_format(format));
+}
+
+static uint32_t
+ac_get_gfx10_img_format(const struct radeon_info *info, const enum amd_gfx_level gfx_level,
+                        const struct ac_texture_state *state)
 {
    const struct gfx10_format *fmt = &ac_get_gfx10_format_table(gfx_level)[state->format];
    const struct util_format_description *desc = util_format_description(state->format);
    uint32_t img_format = fmt->img_format;
+
+   if (info->gfx11_shader_core) {
+      const uint32_t astc = ac_xclipse_astc_img_format(state->format);
+      if (astc)
+         return astc;
+      const uint32_t etc2 = ac_xclipse_etc2_img_format(state->format);
+      if (etc2)
+         return etc2;
+   }
 
    if (desc->colorspace == UTIL_FORMAT_COLORSPACE_ZS &&
        state->gfx10.upgraded_depth && !util_format_has_stencil(desc)) {
@@ -507,7 +593,9 @@ ac_build_gfx10_texture_descriptor(const struct radeon_info *info, const struct a
 {
    const struct radeon_surf *surf = state->surf;
    const struct util_format_description *fmt_desc = util_format_description(state->format);
-   const uint32_t img_format = ac_get_gfx10_img_format(info->gfx_level, state);
+   /* The texture unit consumes this descriptor, so the FORMAT enum has to match the shader core's
+    * generation, which is not gfx_level on Xclipse (see radeon_info::desc_gfx_level). */
+   uint32_t img_format = ac_get_gfx10_img_format(info, info->desc_gfx_level, state);
    const struct ac_surf_nbc_view *nbc_view = state->gfx10.nbc_view;
    uint32_t num_samples;
 
@@ -549,7 +637,7 @@ ac_build_gfx10_texture_descriptor(const struct radeon_info *info, const struct a
       max_mip = nbc_view->num_levels - 1;
 
    const uint32_t min_lod_clamped = util_unsigned_fixed(CLAMP(state->min_lod, 0, 15), 8);
-   if (info->gfx_level >= GFX11) {
+   if (info->desc_gfx_level >= GFX11) {
       desc[1] |= S_00A004_MAX_MIP_GFX11(max_mip);
       desc[5] |= S_00A014_MIN_LOD_LO_GFX11(min_lod_clamped);
       desc[6] |= S_00A018_MIN_LOD_HI(min_lod_clamped >> 5);
@@ -570,7 +658,7 @@ ac_build_gfx12_texture_descriptor(const struct radeon_info *info, const struct a
 {
    const struct radeon_surf *surf = state->surf;
    const struct util_format_description *fmt_desc = util_format_description(state->format);
-   const uint32_t img_format = ac_get_gfx10_img_format(info->gfx_level, state);
+   const uint32_t img_format = ac_get_gfx10_img_format(info, info->gfx_level, state);
    const uint32_t field_last_level = state->num_samples > 1 ? util_logbase2(state->num_samples) : state->last_level;
    const bool no_edge_clamp = state->num_levels > 1 && util_format_is_compressed(state->img_format) &&
                               !util_format_is_compressed(state->format);
@@ -763,6 +851,10 @@ ac_set_mutable_tex_desc_fields(const struct radeon_info *info, const struct ac_m
 
          desc[7] = meta_va >> 16;
       }
+
+      /* TITAN wants ITERATE_256 on every image; see ac_titan_tex_iterate256(). */
+      if (ac_titan_tex_iterate256())
+         desc[6] |= S_00A018_ITERATE_256(1);
    } else if (info->gfx_level == GFX9) {
       desc[0] |= surf->tile_swizzle;
 
@@ -772,6 +864,17 @@ ac_set_mutable_tex_desc_fields(const struct radeon_info *info, const struct ac_m
       } else {
          desc[3] |= S_008F1C_SW_MODE(surf->u.gfx9.swizzle_mode);
          desc[4] |= S_008F20_PITCH(surf->u.gfx9.epitch);
+      }
+
+      if (info->gfx_level >= GFX10) {
+         RADV_LOGI("[TEX_DESC] va=0x%llx swizzle=%u sw_mode=%u surf_off=%llu pitch=%u uses_custom_pitch=%d is_linear=%d",
+                   (unsigned long long)va, swizzle, surf->u.gfx9.swizzle_mode,
+                   (unsigned long long)surf->u.gfx9.surf_offset,
+                   surf->u.gfx9.surf_pitch, surf->u.gfx9.uses_custom_pitch, surf->is_linear);
+         RADV_LOGI("[TEX_DESC] desc[0]=0x%08x desc[1]=0x%08x desc[2]=0x%08x desc[3]=0x%08x",
+                   desc[0], desc[1], desc[2], desc[3]);
+         RADV_LOGI("[TEX_DESC] desc[4]=0x%08x desc[5]=0x%08x desc[6]=0x%08x desc[7]=0x%08x",
+                   desc[4], desc[5], desc[6], desc[7]);
       }
 
       if (meta_va) {
@@ -1032,14 +1135,18 @@ ac_init_gfx9_ds_surface(const struct radeon_info *info, const struct ac_ds_state
                            S_028008_SLICE_MAX_HI(state->last_layer >> 11);
    }
 
+   /* TITAN sets ITERATE_256 (bit 20) on a single-sample depth surface: the vendor's DB_Z_INFO is
+    * 0xa0100183 vs our 0xa0000183. Gated on the DB remap level. */
+   const bool titan_iterate256 = ac_titan_db_active();
+
    ds->db_z_info = S_028038_FORMAT(db_format) |
                    S_028038_NUM_SAMPLES(util_logbase2(state->num_samples)) |
                    S_028038_SW_MODE(surf->u.gfx9.swizzle_mode) |
                    S_028038_MAXMIP(state->num_levels - 1) |
-                   S_028040_ITERATE_256(info->gfx_level >= GFX11);
+                   S_028040_ITERATE_256(info->gfx_level >= GFX11 || titan_iterate256);
    ds->db_stencil_info = S_02803C_FORMAT(stencil_format) |
                          S_02803C_SW_MODE(surf->u.gfx9.zs.stencil_swizzle_mode) |
-                         S_028044_ITERATE_256(info->gfx_level >= GFX11);
+                         S_028044_ITERATE_256(info->gfx_level >= GFX11 || titan_iterate256);
 
    if (info->gfx_level == GFX9) {
       ds->u.gfx6.db_z_info2 = S_028068_EPITCH(surf->u.gfx9.epitch);
@@ -1349,6 +1456,17 @@ ac_init_gfx10_cb_surface(const struct radeon_info *info, const struct ac_cb_stat
                              S_028C74_NUM_FRAGMENTS_GFX6(util_logbase2(state->num_storage_samples)) |
                              S_028C74_FORCE_DST_ALPHA_1_GFX6(force_dst_alpha_1);
       cb->cb_dcc_control |= S_028C78_INDEPENDENT_128B_BLOCKS_GFX10(surf->u.gfx9.color.dcc.independent_128B_blocks);
+
+      /* Xclipse 920: the CB reads CB_COLOR_ATTRIB in the GFX11 layout; with the GFX10_3 encoding
+       * partially covered MSAA draws hang. Encode like the vendor (0x12 for 4x: NUM_FRAGMENTS[0:1] +
+       * LIMIT_COLOR_FETCH_TO_256B_MAX bit4; bit4 must not be set on single-sample targets). */
+      if (info->gfx11_shader_core && state->num_storage_samples > 1) {
+         /* Drop the GFX10_3 sample/fragment/FMASK fields [0:19] entirely. */
+         cb->cb_color_attrib &= ~0xFFFFFu;
+         cb->cb_color_attrib |= S_028C74_NUM_FRAGMENTS_GFX11(util_logbase2(state->num_storage_samples)) |
+                                S_028C74_FORCE_DST_ALPHA_1_GFX11(force_dst_alpha_1) |
+                                1u << 4; /* LIMIT_COLOR_FETCH_TO_256B_MAX (GFX11 position) */
+      }
    }
 }
 

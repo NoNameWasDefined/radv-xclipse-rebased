@@ -12,8 +12,23 @@
 #include "ac_cmdbuf_base.h"
 #include "ac_pm4.h"
 #include "sid.h"
+#include "ac_titan_regmap.h"
 
 #include "util/bitset.h"
+
+#include <stdlib.h>
+
+/* getenv() once per process, for knobs read on hot paths (getenv walks environ: 35-170 ns per
+ * call). Same semantics: NULL = unset, an empty variable counts as set. Racing threads can at worst
+ * both call getenv(). */
+#define AC_XCLIPSE_GETENV_ONCE(name)                                                               \
+   __extension__({                                                                                 \
+      static const char *ac_xe_cached = (const char *)1;                                           \
+      const char *ac_xe_val = ac_xe_cached;                                                        \
+      if (ac_xe_val == (const char *)1)                                                            \
+         ac_xe_cached = ac_xe_val = getenv(name);                                                  \
+      ac_xe_val;                                                                                   \
+   })
 
 #ifdef __cplusplus
 extern "C" {
@@ -299,7 +314,12 @@ struct ac_tracked_regs {
    do {                                                                                   \
       assert((reg) >= prefix_name##_REG_OFFSET && (reg) < prefix_name##_REG_END);         \
       ac_cmdbuf_emit(PKT3(packet, num, 0) | PKT3_RESET_FILTER_CAM_S(reset_filter_cam));   \
-      ac_cmdbuf_emit((((reg) - prefix_name##_REG_OFFSET) >> 2) | ((idx) << 28));          \
+      /* Where a write becomes a dword offset: apply TITAN's map (no-op elsewhere). */     \
+      ac_titan_check_run(prefix_name##_REG_OFFSET,                                         \
+                         ((reg) - prefix_name##_REG_OFFSET) >> 2, (num));              \
+      ac_cmdbuf_emit(ac_titan_remap_dw(prefix_name##_REG_OFFSET,                           \
+                                       ((reg) - prefix_name##_REG_OFFSET) >> 2) |          \
+                     ((idx) << 28));                                                       \
    } while (0)
 
 #define __ac_cmdbuf_set_reg(reg, idx, value, prefix_name, packet)                         \
@@ -356,10 +376,16 @@ struct ac_tracked_regs {
 
 #define ac_cmdbuf_set_sh_reg(reg, value) __ac_cmdbuf_set_reg(reg, 0, value, SI_SH, PKT3_SET_SH_REG)
 
-#define ac_cmdbuf_emit_32bit_pointer(sh_offset, va, info)         \
-   do {                                                           \
-      assert((va) == 0 || ((va) >> 32) == (info)->address32_hi);  \
-      ac_cmdbuf_set_sh_reg(sh_offset, va);                        \
+/* This macro writes only the low 32 bits of `va`; the shader pastes address32_hi on top
+ * (radv_nir_lower_descriptors.c, radv_nir_lower_vs_inputs.c). On the Xclipse 920 the address space
+ * straddles two 4 GiB regions, so a VA in the wrong one is read 4 GiB away. The assert is compiled
+ * out of release builds, so violations are also counted and reported at runtime. */
+#define ac_cmdbuf_emit_32bit_pointer(sh_offset, va, info)                     \
+   do {                                                                       \
+      assert((va) == 0 || ((va) >> 32) == (info)->address32_hi);              \
+      if ((va) != 0 && (uint32_t)((uint64_t)(va) >> 32) != (info)->address32_hi) \
+         ac_xclipse_va32_violation((uint64_t)(va), (info)->address32_hi);      \
+      ac_cmdbuf_set_sh_reg(sh_offset, va);                                    \
    } while (0)
 
 #define ac_cmdbuf_emit_64bit_pointer(sh_offset, va)   \
@@ -721,6 +747,11 @@ ac_set_tracked_regs_to_clear_state(struct ac_tracked_regs *tracked_regs,
 
 void
 ac_cmdbuf_flush_vgt_streamout(struct ac_cmdbuf *cs, enum amd_gfx_level gfx_level);
+
+/* Xclipse: a 32-bit pointer outside the address32_hi window (see ac_cmdbuf_emit_32bit_pointer). */
+void ac_xclipse_va32_violation(uint64_t va, uint32_t address32_hi);
+/* Xclipse 530: report register runs that TITAN's map splits (see ac_titan_check_run). */
+int ac_xclipse_runcheck(void);
 
 #ifdef __cplusplus
 }
