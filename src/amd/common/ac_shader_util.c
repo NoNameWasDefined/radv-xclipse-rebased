@@ -1159,6 +1159,17 @@ union ac_hw_cache_flags ac_get_hw_cache_flags(enum amd_gfx_level gfx_level,
        * "stream" allows write combining in GL2. "coherent bypass" doesn't.
        * "non-coherent bypass" doesn't guarantee ordering with any coherent stores.
        */
+      /* Xclipse 920 workaround (DEGGIGXX2_4051 / INCONSISTENT_GL2_CACHE_POLICY): force GLC on all
+       * memory instructions, as Samsung's driver does (inconsistent GL2 coherency between data-port
+       * and texture-pipe paths). Also force DLC on loads to bypass the L1 tex and GL2 caches: the
+       * SQIMG unit cannot see CPU or image_store writes otherwise.
+       */
+      if (gfx_level <= GFX10_3) {
+         result.value |= ac_glc;
+         if (!is_store)
+            result.value |= ac_dlc;
+      }
+
       if (scope_is_device && type != ac_access_type_atomic)
          result.value |= ac_glc | (type == ac_access_type_load ? ac_dlc : 0);
 

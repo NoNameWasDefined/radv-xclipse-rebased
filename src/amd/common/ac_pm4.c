@@ -388,6 +388,16 @@ void ac_pm4_set_reg(struct ac_pm4_state *state, unsigned reg, uint32_t val)
       return;
    }
 
+   /* Remap the preamble through the TITAN table too: this function does its own byte->dword
+    * conversion, so preamble writes landed at GFX10_3 offsets (e.g. DB_RMI_L2_CACHE_CONTROL at
+    * 0x01f instead of TITAN's 0x01a). RADV_XCLIPSE_PREMAP=0 keeps the old behaviour. */
+   if (ac_titan_regmap_active && ac_titan_preamble_remap()) {
+      if (opcode == PKT3_SET_CONTEXT_REG)
+         reg = ac_titan_remap_dw(SI_CONTEXT_REG_OFFSET, reg >> 2) << 2;
+      else if (opcode == PKT3_SET_SH_REG)
+         reg = ac_titan_remap_dw(SI_SH_REG_OFFSET, reg >> 2) << 2;
+   }
+
    if (is_privileged_reg(state, original_reg)) {
       ac_pm4_set_privileged_reg(state, original_reg, val);
    } else {
