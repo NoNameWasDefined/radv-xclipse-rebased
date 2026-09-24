@@ -165,13 +165,13 @@ aco_postprocess_shader(const struct aco_compiler_options* options,
 
    insert_waitcnt(program.get());
    insert_NOPs(program.get());
-   if (program->gfx_level >= GFX11)
+   if (program->gfx_level >= GFX11 && !program->dev.no_delay_alu)
       insert_delay_alu(program.get());
 
    if (program->gfx_level >= GFX10)
       form_hard_clauses(program.get());
 
-   if (program->gfx_level >= GFX11)
+   if (program->gfx_level >= GFX11 && !program->dev.no_delay_alu)
       combine_delay_alu(program.get());
 
    if (program->collect_statistics || (debug_flags & DEBUG_PERF_INFO))

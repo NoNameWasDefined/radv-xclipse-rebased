@@ -2305,6 +2305,8 @@ struct DeviceInfo {
    bool has_point_sample_accel = false;
    bool has_gfx6_mrt_export_bug = false;
    bool has_desc_resource_level = false;
+   bool has_vopd = false;
+   bool no_delay_alu = false;
 
    int32_t scratch_global_offset_min;
    int32_t scratch_global_offset_max;
@@ -2343,6 +2345,22 @@ public:
    bool has_smem_buffer_or_global_loads = false;
    bool has_pops_overlapped_waves_wait = false;
    bool has_color_exports = false;
+   /* Xclipse 920: GFX11 ISA, GFX10.3 export consumer. GFX11 reused the EXP VM/COMPR bits as ROW_EN,
+    * so encode exports the GFX10 way. See emit_exp_instruction(). */
+   bool gfx10_export_encoding = false;
+   /* Xclipse 920 (GFX10_4): no separate FMASK T#; FMASK data comes through the colour T# via
+    * image_load dmask:1 dim:2D_MSAA (with an extra ignored sample coordinate). See visit_tex(). */
+   bool gfx10_4_fmask = false;
+   /* Xclipse 920 (GFX10_4): the message bus is GFX10.3, so s_sendmsg imm 3 is GS_DONE, not
+    * dealloc_vgprs. Never insert dealloc_vgprs. */
+   bool gfx10_sendmsg = false;
+   /* Xclipse 920 (GFX10_4): the MIMG address decoder does not implement GFX11 partial NSA, where
+    * the last NSA register continues contiguously with the rest of the address. A sample_d with a
+    * 2D coordinate has six address operands, so GFX11 would put u,v in one two-register tail --
+    * and this hardware reads v from the wrong register (Minecraft 26.x terrain samples its atlas
+    * with textureGrad). Use NSA only when every operand gets its own slot, as on GFX10.3.
+    * See lower_image_sample(). */
+   bool gfx10_nsa = false;
    bool is_prolog = false;
    bool is_epilog = false;
 

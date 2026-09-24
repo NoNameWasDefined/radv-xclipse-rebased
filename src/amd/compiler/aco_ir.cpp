@@ -70,6 +70,18 @@ init_program(Program* program, Stage stage, const struct aco_shader_info* info,
    program->config = config;
    program->info = *info;
    program->gfx_level = options->gfx_level;
+   /* Xclipse 920: GFX11 ISA, but the SX/CB consuming exports is GFX10.3 and wants the VM/COMPR bits.
+    * A real GFX11 part is never CHIP_VANGOGH. */
+   const bool xclipse_920 = options->gfx_level >= GFX11 && options->family == CHIP_VANGOGH;
+   /* The Xclipse 530 (CHIP_TITAN) needs the export encoding too: without the VM bit the DB never
+    * learns which pixels a shader discarded, and they write depth (cutout grass hiding the water
+    * behind it). The other three are the 920's alone; the 530 runs geometry and textureGrad fine
+    * without them. */
+   program->gfx10_export_encoding =
+      xclipse_920 || (options->gfx_level >= GFX11 && options->family == CHIP_TITAN);
+   program->gfx10_4_fmask = xclipse_920;
+   program->gfx10_sendmsg = xclipse_920;
+   program->gfx10_nsa = xclipse_920;
    program->wave_size = info->wave_size;
    program->lane_mask = program->wave_size == 32 ? s1 : s2;
    program->preserve_s2 = info->vs.preserve_s2;
@@ -122,6 +134,8 @@ init_program(Program* program, Stage stage, const struct aco_shader_info* info,
    program->dev.has_mad32 = options->compiler_info->has_mad32;
 
    program->dev.has_desc_resource_level = options->compiler_info->has_desc_resource_level;
+   program->dev.has_vopd = options->has_vopd;
+   program->dev.no_delay_alu = options->no_delay_alu;
 
    if (program->gfx_level >= GFX12) {
       program->dev.scratch_global_offset_min = -8388608;
@@ -194,9 +208,11 @@ is_wait_export_ready(amd_gfx_level gfx_level, const Instruction* instr)
 }
 
 static bool
-is_done_sendmsg(amd_gfx_level gfx_level, const Instruction* instr)
+is_done_sendmsg(const Program* program, const Instruction* instr)
 {
-   if (gfx_level <= GFX10_3 && instr->opcode == aco_opcode::s_sendmsg)
+   /* On the Xclipse hybrid the message bus is GFX10.3, so gs_done exists despite GFX11 ISA. */
+   if ((program->gfx_level <= GFX10_3 || program->gfx10_sendmsg) &&
+       instr->opcode == aco_opcode::s_sendmsg)
       return (instr->salu().imm & sendmsg_id_mask) == sendmsg_gs_done;
    return false;
 }
@@ -245,7 +261,7 @@ is_atomic_or_control_instr(Program* program, const Instruction* instr, memory_sy
          return cls & ~storage_shared;
    }
    if (is_release) {
-      if (is_done_sendmsg(program->gfx_level, instr) ||
+      if (is_done_sendmsg(program, instr) ||
           is_pos_prim_export(program->gfx_level, instr))
          return cls & ~storage_shared;
 
