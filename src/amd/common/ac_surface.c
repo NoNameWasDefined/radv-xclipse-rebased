@@ -3934,6 +3934,11 @@ int ac_compute_surface(struct ac_addrlib *addrlib, const struct radeon_info *inf
       surf->alignment_log2 = MAX2(surf->alignment_log2, surf->fmask_alignment_log2);
    }
 
+   /* Xclipse 920: MSAA the GFX11 way, no CMASK fast clears (the FMASK-free fetch path cannot decode
+    * cmask-tagged blocks). */
+   if (info->gfx11_shader_core && config->info.samples >= 2)
+      surf->cmask_size = 0;
+
    /* Single-sample CMASK is in a separate buffer. */
    if (surf->cmask_size && config->info.samples >= 2) {
       surf->cmask_offset = align64(surf->total_size, 1ull << surf->cmask_alignment_log2);

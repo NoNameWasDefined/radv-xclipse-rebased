@@ -5,10 +5,15 @@
 
 #include "util/os_drm.h"
 #include "ac_linux_drm.h"
+#include "util/simple_mtx.h"
 #include "util/os_misc.h"
+#include "util/os_time.h"
 #include "util/u_math.h"
 #include "util/u_sync_provider.h"
 #include "ac_gpu_info.h"
+#include <android/log.h>
+#include <errno.h>
+#include "drm-uapi/drm.h"
 
 #include <stdlib.h>
 #include <time.h>
@@ -470,8 +475,37 @@ int ac_drm_cs_import_syncobj(ac_drm_device *dev, int shared_fd, uint32_t *handle
    return dev->p->fd_to_handle(dev->p, shared_fd, handle);
 }
 
+/* Samsung sgpu (Xclipse 920, DRM 3.40 fork): exporting a sync file from a syncobj whose fence is
+ * not yet materialized hard-locks the kernel. These wrappers are the other export route (winsys
+ * empty submits, semaphore conversion): wait for materialization, refuse the export on timeout.
+ * See vk_drm_syncobj.c. */
+static int
+ac_drm_syncobj_wait_materialized(ac_drm_device *dev, uint32_t syncobj)
+{
+   int64_t abs_timeout = (int64_t)os_time_get_absolute_timeout(5ull * 1000 * 1000 * 1000 /* 5s */);
+
+   /* WAIT_FOR_SUBMIT alone also waits for the fence to SIGNAL, which made every present wait for
+    * the GPU to finish the frame. WAIT_AVAILABLE returns once the fence exists; only the timeline
+    * wait ioctl takes it (point 0 = the binary payload). Kernels without timeline syncobjs fall
+    * back to the full wait. */
+   if (dev->p->timeline_wait) {
+      uint64_t point = 0;
+      int ret = dev->p->timeline_wait(dev->p, &syncobj, &point, 1, abs_timeout,
+                                      DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT |
+                                         DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE,
+                                      NULL);
+      if (ret != -EINVAL && ret != -EOPNOTSUPP)
+         return ret;
+   }
+   return dev->p->wait(dev->p, &syncobj, 1, abs_timeout,
+                       DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL);
+}
+
 int ac_drm_cs_syncobj_export_sync_file(ac_drm_device *dev, uint32_t syncobj, int *sync_file_fd)
 {
+   int ret = ac_drm_syncobj_wait_materialized(dev, syncobj);
+   if (ret)
+      return ret;
    return dev->p->export_sync_file(dev->p, syncobj, sync_file_fd);
 }
 
@@ -487,13 +521,16 @@ int ac_drm_cs_syncobj_export_sync_file2(ac_drm_device *dev, uint32_t syncobj, ui
    int ret;
 
    if (!point)
-      return dev->p->export_sync_file(dev->p, syncobj, sync_file_fd);
+      return ac_drm_cs_syncobj_export_sync_file(dev, syncobj, sync_file_fd);
 
    ret = dev->p->create(dev->p, 0, &binary_handle);
    if (ret)
       return ret;
 
    ret = dev->p->transfer(dev->p, binary_handle, 0, syncobj, point, flags);
+   if (ret)
+      goto out;
+   ret = ac_drm_syncobj_wait_materialized(dev, binary_handle);
    if (ret)
       goto out;
    ret = dev->p->export_sync_file(dev->p, binary_handle, sync_file_fd);
@@ -565,10 +602,38 @@ int ac_drm_query_info(ac_drm_device *dev, unsigned info_id, unsigned size, void 
    return drm_ioctl_write(dev->fd, DRM_AMDGPU_INFO, &request, sizeof(struct drm_amdgpu_info));
 }
 
+/* Cache raw MMIO register reads. RADV initialises the device three times (the vendor once), and
+ * the repeat READ_MMR_REGs land 1-10ms after the power-domain resume edge. These registers are
+ * static configuration, so repeats are served from the cache. */
+#define AC_MMR_CACHE_MAX 16
+static struct {
+   unsigned dword_offset, count;
+   uint32_t instance, flags;
+   uint32_t values[32];
+   bool valid;
+} ac_mmr_cache[AC_MMR_CACHE_MAX];
+static simple_mtx_t ac_mmr_cache_lock = SIMPLE_MTX_INITIALIZER;
+
 int ac_drm_read_mm_registers(ac_drm_device *dev, unsigned dword_offset, unsigned count,
                              uint32_t instance, uint32_t flags, uint32_t *values)
 {
    struct drm_amdgpu_info request;
+
+   /* Serve an identical repeat query from the cache. */
+   const bool cacheable = count <= 32;
+   if (cacheable) {
+      simple_mtx_lock(&ac_mmr_cache_lock);
+      for (unsigned i = 0; i < AC_MMR_CACHE_MAX; i++) {
+         if (ac_mmr_cache[i].valid && ac_mmr_cache[i].dword_offset == dword_offset &&
+             ac_mmr_cache[i].count == count && ac_mmr_cache[i].instance == instance &&
+             ac_mmr_cache[i].flags == flags) {
+            memcpy(values, ac_mmr_cache[i].values, count * sizeof(uint32_t));
+            simple_mtx_unlock(&ac_mmr_cache_lock);
+            return 0;
+         }
+      }
+      simple_mtx_unlock(&ac_mmr_cache_lock);
+   }
 
    memset(&request, 0, sizeof(request));
    request.return_pointer = (uintptr_t)values;
@@ -583,7 +648,90 @@ int ac_drm_read_mm_registers(ac_drm_device *dev, unsigned dword_offset, unsigned
    if (dev->is_virtio)
       return amdvgpu_query_info(dev->vdev, &request);
 #endif
-   return drm_ioctl_write(dev->fd, DRM_AMDGPU_INFO, &request, sizeof(struct drm_amdgpu_info));
+   int r = drm_ioctl_write(dev->fd, DRM_AMDGPU_INFO, &request, sizeof(struct drm_amdgpu_info));
+
+   /* Remember a successful read. */
+   if (!r && cacheable) {
+      simple_mtx_lock(&ac_mmr_cache_lock);
+      for (unsigned i = 0; i < AC_MMR_CACHE_MAX; i++) {
+         if (!ac_mmr_cache[i].valid) {
+            ac_mmr_cache[i].dword_offset = dword_offset;
+            ac_mmr_cache[i].count = count;
+            ac_mmr_cache[i].instance = instance;
+            ac_mmr_cache[i].flags = flags;
+            memcpy(ac_mmr_cache[i].values, values, count * sizeof(uint32_t));
+            ac_mmr_cache[i].valid = true;
+            break;
+         }
+      }
+      simple_mtx_unlock(&ac_mmr_cache_lock);
+   }
+   return r;
+}
+
+/* Dump the GPU's busy/stall state. The kernel hang check (gfx_v10_0_check_soft_reset()) reads only
+ * GRBM_STATUS shader-array bits and GRBM_STATUS2.RLC_BUSY, never CP_STAT, CP_STALLED_STAT1..3,
+ * CP_CPF_*, CP_CPC_* or GRBM_STATUS2.UTCL2_*. All are in nv_allowed_read_registers[] and reading
+ * them needs no BO, CS or GFXHUB flush.
+ * Offsets: GC_BASE__INST0_SEG0 (0x1260 on vangogh_lite) + mmREG from gc_10_4_0_offset.h
+ * (GRBM_STATUS = dword 0x2004 = byte 0x8010).
+ * Bypasses the MMR cache: these are live state. */
+#define AC_XCLIPSE_GC_BASE 0x1260u
+static const struct { const char *name; unsigned off; } ac_xclipse_status_regs[] = {
+   {"GRBM_STATUS",          AC_XCLIPSE_GC_BASE + 0x0da4}, {"GRBM_STATUS2",         AC_XCLIPSE_GC_BASE + 0x0da2},
+   {"GRBM_STATUS_SE0",      AC_XCLIPSE_GC_BASE + 0x0da5}, {"GRBM_STATUS_SE1",      AC_XCLIPSE_GC_BASE + 0x0da6},
+   {"CP_STAT",              AC_XCLIPSE_GC_BASE + 0x0f40}, {"CP_STALLED_STAT1",     AC_XCLIPSE_GC_BASE + 0x0f3d},
+   {"CP_STALLED_STAT2",     AC_XCLIPSE_GC_BASE + 0x0f3e}, {"CP_STALLED_STAT3",     AC_XCLIPSE_GC_BASE + 0x0f3c},
+   {"CP_CPF_BUSY_STAT",     AC_XCLIPSE_GC_BASE + 0x0e28}, {"CP_CPF_STALLED_STAT1", AC_XCLIPSE_GC_BASE + 0x0e29},
+   {"CP_CPF_STATUS",        AC_XCLIPSE_GC_BASE + 0x0e27}, {"CP_CPC_BUSY_STAT",     AC_XCLIPSE_GC_BASE + 0x0e25},
+   {"CP_CPC_STALLED_STAT1", AC_XCLIPSE_GC_BASE + 0x0e26}, {"CP_CPC_STATUS",        AC_XCLIPSE_GC_BASE + 0x0e24},
+};
+
+void ac_drm_dump_gpu_status(ac_drm_device *dev, const char *tag)
+{
+   struct drm_amdgpu_info request;
+   char line[512];
+   int n = 0, nfail = 0;
+   uint32_t grbm = 0, grbm2 = 0;
+
+   for (unsigned i = 0; i < ARRAY_SIZE(ac_xclipse_status_regs); i++) {
+      uint32_t v = 0;
+      memset(&request, 0, sizeof(request));
+      request.return_pointer = (uintptr_t)&v;
+      request.return_size = sizeof(v);
+      request.query = AMDGPU_INFO_READ_MMR_REG;
+      request.read_mmr_reg.dword_offset = ac_xclipse_status_regs[i].off;
+      request.read_mmr_reg.count = 1;
+      request.read_mmr_reg.instance = 0xffffffff;
+      request.read_mmr_reg.flags = 0;
+
+      if (drm_ioctl_write(dev->fd, DRM_AMDGPU_INFO, &request, sizeof(request))) {
+         nfail++;
+         continue;
+      }
+      if (i == 0) grbm = v;
+      if (i == 1) grbm2 = v;
+      n += snprintf(line + n, sizeof(line) - n, "%s%s=0x%08x",
+                    n ? " " : "", ac_xclipse_status_regs[i].name, v);
+      if (n >= (int)sizeof(line)) { n = sizeof(line) - 1; break; }
+   }
+
+   if (nfail == (int)ARRAY_SIZE(ac_xclipse_status_regs)) {
+      __android_log_print(ANDROID_LOG_WARN, "RADV_GPUSTAT",
+                          "[GPUSTAT:%s] every READ_MMR_REG rejected -- wrong node, or the "
+                          "whitelist is absent on this kernel", tag);
+      return;
+   }
+
+   /* Summary line. Idle and wedged GPUs both show GUI_ACTIVE=0/CP_BUSY=0; look at CP_* and UTCL2_*. */
+   __android_log_print(ANDROID_LOG_INFO, "RADV_GPUSTAT",
+                       "[GPUSTAT:%s] GUI_ACTIVE=%u CP_BUSY=%u | UTCL2_BUSY=%u UTCL2_RQ_PENDING=%u "
+                       "CPF=%u CPC=%u CPG=%u CPAXI=%u RLC=%u%s",
+                       tag, (grbm >> 31) & 1, (grbm >> 29) & 1, (grbm2 >> 15) & 1,
+                       (grbm2 >> 18) & 1, (grbm2 >> 28) & 1, (grbm2 >> 29) & 1, (grbm2 >> 30) & 1,
+                       (grbm2 >> 31) & 1, (grbm2 >> 24) & 1,
+                       nfail ? "  (SOME READS REJECTED)" : "");
+   __android_log_print(ANDROID_LOG_INFO, "RADV_GPUSTAT", "[GPUSTAT:%s] %s", tag, line);
 }
 
 int ac_drm_query_hw_ip_count(ac_drm_device *dev, unsigned type, uint32_t *count)
@@ -727,9 +875,24 @@ int ac_drm_query_gpu_info(ac_drm_device *dev, struct amdgpu_gpu_info *info)
       }
    }
 
-   r = ac_drm_read_mm_registers(dev, 0x263e, 1, 0xffffffff, 0, &info->gb_addr_cfg);
-   if (r)
-      return r;
+   /* Take gb_addr_cfg from libdrm: amdgpu_device_initialize() already read 0x263e and cached it,
+    * so this read is a duplicate raw MMIO access. */
+   {
+      bool have_it = false;
+      if (!dev->is_virtio && dev->adev) {
+         struct amdgpu_gpu_info libdrm_info;
+         if (amdgpu_query_gpu_info(dev->adev, &libdrm_info) == 0) {
+            info->gb_addr_cfg = libdrm_info.gb_addr_cfg;
+            have_it = true;
+         }
+      }
+
+      if (!have_it) {
+         r = ac_drm_read_mm_registers(dev, 0x263e, 1, 0xffffffff, 0, &info->gb_addr_cfg);
+         if (r)
+            return r;
+      }
+   }
 
    if (info->family_id < AMDGPU_FAMILY_AI) {
       r = ac_drm_read_mm_registers(dev, 0x2644, 32, 0xffffffff, 0, info->gb_tile_mode);

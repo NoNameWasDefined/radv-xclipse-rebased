@@ -106,6 +106,9 @@ struct amd_ip_info {
 
 struct ac_compiler_info {
    enum amd_gfx_level gfx_level;
+   /* Generation of the shader core: the ISA to emit and the descriptor encoding the texture unit
+    * reads. Differs from gfx_level only on Xclipse (see radeon_info::gfx11_shader_core). */
+   enum amd_gfx_level desc_gfx_level;
    uint32_t max_waves_per_simd;
    uint32_t num_physical_sgprs_per_simd;
    uint32_t num_physical_wave64_vgprs_per_simd;
@@ -209,6 +212,15 @@ struct ac_compiler_info {
    uint32_t reserved : 2;
 };
 
+/* Samsung Xclipse variants: same pci_id 0x73A0, sgpu kernel, ioctl ABI and shader core design;
+ * they differ in scale and kernel family id. Resolved from ro.soc.model, checked against chip_rev. */
+enum ac_xclipse_model {
+   AC_XCLIPSE_NONE = 0,  /* not an Xclipse at all */
+   AC_XCLIPSE_920,       /* s5e9925/s5e9935, MGFX0, kernel family VGH(144), 6 CU, 4 L2 */
+   AC_XCLIPSE_530,       /* s5e8845, MGFX1_MID, kernel family MGFX(147), 2 CU, 1 L2 */
+   AC_XCLIPSE_UNKNOWN,   /* a 0x73A0 whose SoC we do not recognise -- treat conservatively */
+};
+
 struct radeon_info {
    /* Device info. */
    char marketing_name[64];
@@ -249,6 +261,16 @@ struct radeon_info {
    uint32_t pci_rev_id;
    enum radeon_family family;
    enum amd_gfx_level gfx_level;
+   /* The Samsung Xclipse 920 (Exynos 2200) pairs a GFX10_3 command processor and register
+    * interface with a GFX11 shader core (the vendor's PAL driver calls the asic "GFX10_4").
+    * Anything the shader core consumes -- the ISA, and the descriptors the texture unit reads --
+    * must be built as GFX11, while state and register emission stay at gfx_level.
+    */
+   bool gfx11_shader_core;
+   /* GFX11 on Xclipse, gfx_level everywhere else. Use for descriptor (V#/T#) encoding. */
+   enum amd_gfx_level desc_gfx_level;
+   /* Which Xclipse. pci_id is 0x73A0 on all of them: key model-specific tuning on this. */
+   enum ac_xclipse_model xclipse_model;
    uint32_t family_id;
    uint32_t chip_external_rev;
    uint32_t chip_rev; /* 0 = A0, 1 = A1, etc. */
@@ -501,6 +523,11 @@ void ac_compute_driver_uuid(char *uuid, size_t size);
 
 void ac_compute_device_uuid(const struct radeon_info *info, char *uuid, size_t size);
 void ac_print_gpu_info(FILE *f, const struct radeon_info *info, int fd);
+
+/* The chip's name for device and renderer strings. The Xclipse 920 runs as CHIP_VANGOGH but is
+ * Samsung's cut-down Van Gogh, VANGOGHLITE; everything keyed on the family (shader caches, ISA,
+ * workarounds) keeps using ac_get_family_name. */
+const char *ac_get_gpu_display_name(const struct radeon_info *info);
 int ac_get_gs_table_depth(enum amd_gfx_level gfx_level, enum radeon_family family);
 void ac_get_raster_config(const struct radeon_info *info, uint32_t *raster_config_p,
                           uint32_t *raster_config_1_p, uint32_t *se_tile_repeat_p);
