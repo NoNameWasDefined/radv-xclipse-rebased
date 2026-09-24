@@ -83,6 +83,13 @@ radv_set_mutable_tex_desc_fields(struct radv_device *device, struct radv_image *
    };
 
    ac_set_mutable_tex_desc_fields(&pdev->info, &ac_state, state);
+
+   /* Xclipse 920 (GFX10_4): final override of the MSAA colour T# meta words (the mutable pass above
+    * re-ORs gfx10 CMASK/ITERATE bits). Vendor words: 6 = 0x402, 7 = 0. */
+   if (pdev->info.gfx11_shader_core && image->vk.samples > 1 && radv_image_has_fmask(image)) {
+      state[6] = 0x402;
+      state[7] = 0;
+   }
 }
 
 /**
@@ -186,6 +193,13 @@ gfx10_make_texture_descriptor(struct radv_device *device, struct radv_image *ima
    };
 
    ac_build_texture_descriptor(&pdev->info, &tex_state, &state[0]);
+
+   /* Xclipse 920 (GFX10_4): match the vendor's MSAA colour T#: word6 = 0x402 (ITERATE_256 | the
+    * GFX10_4 FMASK-compression enable), word7 = 0 (no metadata address; the TA finds FMASK itself). */
+   if (pdev->info.gfx11_shader_core && image->vk.samples > 1 && radv_image_has_fmask(image)) {
+      state[6] = 0x402;
+      state[7] = 0;
+   }
 
    /* Initialize the sampler view for FMASK. */
    if (fmask_state) {
@@ -638,6 +652,29 @@ radv_initialise_vrs_surface(struct radv_image *image, struct radv_buffer *htile_
       S_028ABC_FULL_CACHE(1) | S_028ABC_PIPE_ALIGNED(1) | S_028ABC_VRS_HTILE_ENCODING(V_028ABC_VRS_HTILE_4BIT_ENCODING);
 }
 
+/* BC4_UNORM is carried in the BC3 alpha half, so the texture unit returns it in .a. Map one
+ * component of the app's request (in BC4 terms) onto the hardware channel: BC4 red is BC3 alpha;
+ * green, blue and alpha are the fixed (0, 0, 1). Applied under the app's own component mapping,
+ * with IDENTITY resolved here. */
+static VkComponentSwizzle
+radv_bc4_on_bc3_swizzle(VkComponentSwizzle s, VkComponentSwizzle identity)
+{
+   if (s == VK_COMPONENT_SWIZZLE_IDENTITY)
+      s = identity;
+
+   switch (s) {
+   case VK_COMPONENT_SWIZZLE_R:
+      return VK_COMPONENT_SWIZZLE_A;
+   case VK_COMPONENT_SWIZZLE_G:
+   case VK_COMPONENT_SWIZZLE_B:
+      return VK_COMPONENT_SWIZZLE_ZERO;
+   case VK_COMPONENT_SWIZZLE_A:
+      return VK_COMPONENT_SWIZZLE_ONE;
+   default: /* ZERO and ONE carry no channel and pass through unchanged. */
+      return s;
+   }
+}
+
 void
 radv_image_view_init(struct radv_image_view *iview, struct radv_device *device,
                      const VkImageViewCreateInfo *pCreateInfo,
@@ -646,6 +683,7 @@ radv_image_view_init(struct radv_image_view *iview, struct radv_device *device,
    VK_FROM_HANDLE(radv_image, image, pCreateInfo->image);
    const struct radv_physical_device *pdev = radv_device_physical(device);
    uint32_t plane_count = 1;
+   bool bc4_on_bc3 = false;
 
    const struct VkImageViewSlicedCreateInfoEXT *sliced_3d =
       vk_find_struct_const(pCreateInfo->pNext, IMAGE_VIEW_SLICED_CREATE_INFO_EXT);
@@ -686,6 +724,8 @@ radv_image_view_init(struct radv_image_view *iview, struct radv_device *device,
    /* when the view format is emulated, redirect the view to the hidden plane 1 */
    if (radv_is_format_emulated(pdev, iview->vk.format)) {
       assert(radv_is_format_emulated(pdev, image->vk.format));
+      /* Note the BC3 carrier BEFORE the format is overwritten below. */
+      bc4_on_bc3 = iview->vk.format == VK_FORMAT_BC4_UNORM_BLOCK;
       iview->plane_id = 1;
       iview->vk.view_format = image->planes[iview->plane_id].format;
       iview->vk.format = image->planes[iview->plane_id].format;
@@ -789,11 +829,21 @@ radv_image_view_init(struct radv_image_view *iview, struct radv_device *device,
    const bool stencil_compress_disable = extra_create_info ? extra_create_info->stencil_compress_disable : false;
    bool disable_compression = extra_create_info ? extra_create_info->disable_compression : false;
    bool enable_compression = extra_create_info ? extra_create_info->enable_compression : false;
+   VkComponentMapping components = pCreateInfo->components;
+   if (bc4_on_bc3) {
+      components = (VkComponentMapping){
+         .r = radv_bc4_on_bc3_swizzle(components.r, VK_COMPONENT_SWIZZLE_R),
+         .g = radv_bc4_on_bc3_swizzle(components.g, VK_COMPONENT_SWIZZLE_G),
+         .b = radv_bc4_on_bc3_swizzle(components.b, VK_COMPONENT_SWIZZLE_B),
+         .a = radv_bc4_on_bc3_swizzle(components.a, VK_COMPONENT_SWIZZLE_A),
+      };
+   }
+
    for (unsigned i = 0; i < plane_count; ++i) {
       VkFormat format = vk_format_get_plane_format(iview->vk.view_format, i);
-      radv_image_view_make_descriptor(iview, device, format, &pCreateInfo->components, false, disable_compression,
+      radv_image_view_make_descriptor(iview, device, format, &components, false, disable_compression,
                                       enable_compression, iview->plane_id + i, i, NULL);
-      radv_image_view_make_descriptor(iview, device, format, &pCreateInfo->components, true, disable_compression,
+      radv_image_view_make_descriptor(iview, device, format, &components, true, disable_compression,
                                       enable_compression, iview->plane_id + i, i, sliced_3d);
    }
 

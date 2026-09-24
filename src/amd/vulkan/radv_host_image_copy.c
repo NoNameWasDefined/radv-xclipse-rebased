@@ -6,6 +6,7 @@
 
 #include "radv_device.h"
 #include "radv_entrypoints.h"
+#include "radv_logcat.h"
 #include "radv_image.h"
 #include "radv_physical_device.h"
 
@@ -108,7 +109,12 @@ radv_CopyMemoryToImageEXT(VkDevice _device, const VkCopyMemoryToImageInfo *pCopy
          device, image, copy->pHostPointer, copy->memoryRowLength, copy->memoryImageHeight, &copy->imageSubresource,
          copy->imageOffset, copy->imageExtent, pCopyMemoryToImageInfo->flags);
 
-      if (!ac_surface_copy_mem_to_surface(pdev->addrlib, &pdev->info, surf, &surf_info, &surf_copy_region))
+      const bool ok = ac_surface_copy_mem_to_surface(pdev->addrlib, &pdev->info, surf, &surf_info, &surf_copy_region);
+      RADV_LOGI("[HOST_M2I] dst_va=0x%llx fmt=%u mip=%u ext=%ux%ux%u ok=%d",
+                (unsigned long long)image->bindings[0].addr, (uint32_t)image->vk.format,
+                copy->imageSubresource.mipLevel, copy->imageExtent.width, copy->imageExtent.height,
+                copy->imageExtent.depth, ok);
+      if (!ok)
          return VK_ERROR_INITIALIZATION_FAILED;
    }
 

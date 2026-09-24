@@ -273,6 +273,64 @@ radv_is_copy_image_indirect_format_supported(const struct radv_physical_device *
    return true;
 }
 
+/* The format a BC format is decoded or transcoded into, for texture units without a decoder.
+ * VK_FORMAT_UNDEFINED means "not a BC format we emulate".
+ */
+VkFormat
+radv_bc_emulation_format(VkFormat format)
+{
+   switch (format) {
+   /* BC4/BC5 SNORM decode into channel-exact R8/RG8 planes (same sampling semantics, far less
+    * memory than RGBA8).
+    * BC4_UNORM is transcoded to BC3 (its alpha half is a BC4 block) and decoded by the texture unit;
+    * the view swizzles R <- A. Up to 2 LSB error. */
+   case VK_FORMAT_BC4_UNORM_BLOCK:
+      return VK_FORMAT_BC3_UNORM_BLOCK;
+   /* BC5_UNORM is re-encoded to EAC_R11G11 (both 16 bytes, two channels, 3-bit per-texel indices)
+    * and decoded by the texture unit; within 2 LSB for spread <= 32. Same
+    * (r,g,0,1) semantics, no swizzle. BC5_SNORM stays on the exact decode path. */
+   case VK_FORMAT_BC5_UNORM_BLOCK:
+      return VK_FORMAT_EAC_R11G11_UNORM_BLOCK;
+   /* BC7_UNORM is decoded and re-encoded into BC3 instead of an RGBA8 plane (64 bytes per block):
+    * 85.9% of texels within 10 LSB on the RE7 corpus, for ~10% more work than the RGBA8 decode.
+    * ETC2 (82.8%) and ASTC 4x4 (79.4%, ~13x the encode cost) carriers were measured and dropped.
+    * See bc_decoder.glsl. */
+   case VK_FORMAT_BC7_UNORM_BLOCK:
+      return VK_FORMAT_BC3_UNORM_BLOCK;
+   case VK_FORMAT_BC4_SNORM_BLOCK:
+      return VK_FORMAT_R8_SNORM;
+   case VK_FORMAT_BC5_SNORM_BLOCK:
+      return VK_FORMAT_R8G8_SNORM;
+   case VK_FORMAT_BC7_SRGB_BLOCK:
+      return VK_FORMAT_R8G8B8A8_SRGB;
+   /* BC6H decodes to RGBA16F (8 bytes/texel). E5B9G9R9 was tried and reverted: small channels
+    * quantise to zero under a shared exponent (measured). */
+   case VK_FORMAT_BC6H_UFLOAT_BLOCK:
+   case VK_FORMAT_BC6H_SFLOAT_BLOCK:
+      return VK_FORMAT_R16G16B16A16_SFLOAT;
+   default:
+      return VK_FORMAT_UNDEFINED;
+   }
+}
+
+/* Xclipse 920 samples ASTC LDR with a hardware decoder (see ac_xclipse_astc_img_format). Only the
+ * 28 contiguous LDR formats are native; HDR (ASTC_*_SFLOAT) stays unadvertised. */
+bool
+radv_xclipse_is_native_astc(const struct radv_physical_device *pdev, VkFormat format)
+{
+   return pdev->xclipse_native_astc && format >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK &&
+          format <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK;
+}
+
+/* Same for ETC2/EAC (see ac_xclipse_etc2_img_format): 10 contiguous formats, ETC2_R8G8B8_UNORM ..
+ * EAC_R11G11_SNORM. */
+bool
+radv_xclipse_is_native_etc2(const struct radv_physical_device *pdev, VkFormat format)
+{
+   return pdev->xclipse_native_etc2 && format >= VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK &&
+          format <= VK_FORMAT_EAC_R11G11_SNORM_BLOCK;
+}
+
 bool
 radv_is_format_emulated(const struct radv_physical_device *pdev, VkFormat format)
 {
@@ -280,6 +338,9 @@ radv_is_format_emulated(const struct radv_physical_device *pdev, VkFormat format
       return true;
 
    if (pdev->emulate_astc && vk_texcompress_astc_emulation_format(format) != VK_FORMAT_UNDEFINED)
+      return true;
+
+   if (pdev->emulate_bc && radv_bc_emulation_format(format) != VK_FORMAT_UNDEFINED)
       return true;
 
    return false;
@@ -302,18 +363,27 @@ radv_physical_device_get_format_properties(struct radv_physical_device *pdev, Vk
 
    if ((desc->layout == UTIL_FORMAT_LAYOUT_ETC && !pdev->info.has_etc_support) ||
        desc->layout == UTIL_FORMAT_LAYOUT_ASTC) {
-      if (radv_is_format_emulated(pdev, format)) {
+      /* Native ASTC reports the same features as emulated ASTC and the vendor (0xd401:
+       * SAMPLED|BLIT_SRC|FILTER_LINEAR|TRANSFER_SRC|TRANSFER_DST). */
+      if (radv_is_format_emulated(pdev, format) || radv_xclipse_is_native_astc(pdev, format) ||
+          radv_xclipse_is_native_etc2(pdev, format)) {
          /* required features for compressed formats */
          tiled = VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
                  VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT |
                  VK_FORMAT_FEATURE_2_BLIT_SRC_BIT;
 
-         VkFormat emulation_format = vk_texcompress_etc2_emulation_format(format);
-         if (emulation_format == VK_FORMAT_UNDEFINED)
-            emulation_format = vk_texcompress_astc_emulation_format(format);
+         /* MINMAX only when emulating: the vendor advertises 0xd401 without it for native
+          * compressed formats. */
+         if (!radv_xclipse_is_native_astc(pdev, format) &&
+             !radv_xclipse_is_native_etc2(pdev, format)) {
+            VkFormat emulation_format = vk_texcompress_etc2_emulation_format(format);
+            if (emulation_format == VK_FORMAT_UNDEFINED)
+               emulation_format = vk_texcompress_astc_emulation_format(format);
 
-         if (radv_is_filter_minmax_format_supported(pdev, emulation_format))
-            tiled |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_MINMAX_BIT;
+            if (emulation_format != VK_FORMAT_UNDEFINED &&
+                radv_is_filter_minmax_format_supported(pdev, emulation_format))
+               tiled |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_MINMAX_BIT;
+         }
       }
 
       if (radv_is_copy_image_indirect_format_supported(pdev, format)) {
@@ -532,6 +602,22 @@ radv_physical_device_get_format_properties(struct radv_physical_device *pdev, Vk
    if (radv_is_copy_image_indirect_format_supported(pdev, format)) {
       tiled |= VK_FORMAT_FEATURE_2_COPY_IMAGE_INDIRECT_DST_BIT_KHR;
       linear |= VK_FORMAT_FEATURE_2_COPY_IMAGE_INDIRECT_DST_BIT_KHR;
+   }
+
+   /* The Xclipse 920 texture unit only decodes BC1-BC3. BC4-BC7 are emulated (decoded into a hidden
+    * plane at upload, radv_meta_bc_decode.c): sampleable, never storage or colour attachments. */
+   if (pdev->info.gfx11_shader_core && radv_bc_emulation_format(format) != VK_FORMAT_UNDEFINED) {
+      if (pdev->emulate_bc) {
+         /* Emulated: sampleable, never a storage or colour-attachment target. */
+         tiled &= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                  VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT |
+                  VK_FORMAT_FEATURE_2_BLIT_SRC_BIT;
+      } else {
+         /* No hardware decoder and no emulation: sampling returns zeros. */
+         tiled = 0;
+      }
+      linear = 0;
+      buffer = 0;
    }
 
    out_properties->linearTilingFeatures = linear;
