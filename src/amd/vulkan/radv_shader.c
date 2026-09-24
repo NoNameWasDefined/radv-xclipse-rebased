@@ -9,12 +9,23 @@
  */
 
 #include "radv_shader.h"
+#include "ac_xclipse_log.h"
 #include "meta/radv_meta.h"
+#include "radv_logcat.h"
 #include "nir/nir.h"
 #include "nir/nir_builder.h"
 #include "nir/nir_xfb_info.h"
 #include "nir/radv_meta_nir.h"
 #include "nir/radv_nir.h"
+
+#if DETECT_OS_ANDROID
+#include <android/log.h>
+#include <sys/system_properties.h>
+/* Field diagnostics must use the Android log: Eden captures nothing from stderr. */
+#define radv_xclipse_ext_log(...) AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_EXT", __VA_ARGS__)
+#else
+#define radv_xclipse_ext_log(...) fprintf(stderr, __VA_ARGS__)
+#endif
 #include "spirv/nir_spirv.h"
 #include "tools/radv_debug_hang.h"
 #include "tools/radv_debug_nir.h"
@@ -637,6 +648,22 @@ radv_shader_spirv_to_nir(const struct radv_compiler_info *compiler_info, struct 
       NIR_PASS(_, nir, nir_split_var_copies);
       NIR_PASS(_, nir, nir_split_per_member_structs);
 
+      /* Lower VK_NV_geometry_shader_passthrough here, after nir_split_per_member_structs: later the
+       * marker is gone, earlier gl_PerVertex is still one block with no real locations.
+       * nir_split_per_member_structs carries the passthrough bit down to the members. */
+      if (nir->info.stage == MESA_SHADER_GEOMETRY) {
+         bool pt = false;
+         NIR_PASS(pt, nir, radv_nir_lower_passthrough_gs);
+         if (pt) {
+            static bool announced = false;
+            if (!announced) {
+               announced = true;
+               radv_xclipse_ext_log("VK_NV_geometry_shader_passthrough: this title uses a "
+                                    "passthrough GS; rebuilt it as an ordinary one (first use)");
+            }
+         }
+      }
+
       if (nir->info.stage == MESA_SHADER_FRAGMENT)
          NIR_PASS(_, nir, nir_lower_input_attachments,
                   &(nir_input_attachment_options){
@@ -1172,16 +1199,28 @@ radv_create_shader_arena(struct radv_device *device, struct radv_shader_free_lis
          min_size);
    arena->size = arena_size;
 
-   enum radeon_bo_flag flags = RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_32BIT;
-   if (device->shader_use_invisible_vram)
+   /* PREFER_LOCAL -> VM_ALWAYS_VALID: arenas are long-lived and not shared, so keep them out of the
+    * per-submit bo_list (and its first GART binds). */
+   enum radeon_bo_flag flags =
+      RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_32BIT | RADEON_FLAG_PREFER_LOCAL_BO;
+   if (device->shader_use_invisible_vram) {
       flags |= RADEON_FLAG_NO_CPU_ACCESS;
-   else
+   } else {
       flags |= (pdev->info.cpdma_prefetch_writes_memory ? 0 : RADEON_FLAG_READ_ONLY);
+      /* On SoCs without dedicated VRAM (e.g. Samsung Xclipse 920) the arena BO is downgraded to
+       * GTT. Without RADEON_FLAG_GTT_WC the CPU mapping is cached and memcpy()'d shader bytes are
+       * invisible to the GPU's instruction fetch.
+       */
+      if (pdev->info.vram_size_kb == 0)
+         flags |= RADEON_FLAG_GTT_WC;
+   }
 
    if (replayable)
       flags |= RADEON_FLAG_REPLAYABLE;
 
    VkResult result;
+   RADV_LOGI("[ARENA_CREATE] size=%u flags=0x%x vram_kb=%u has_ded_vram=%u",
+             arena_size, (unsigned)flags, pdev->info.vram_size_kb, pdev->info.has_dedicated_vram);
    result = radv_bo_create(device, NULL, arena_size, RADV_SHADER_ALLOC_ALIGNMENT, RADEON_DOMAIN_VRAM, flags,
                            RADV_BO_PRIORITY_SHADER, replay_va, true, &arena->bo);
    if (result != VK_SUCCESS)
@@ -1648,6 +1687,10 @@ radv_should_use_wgp_mode(enum amd_gfx_level gfx_level, mesa_shader_stage stage, 
    if (gfx_level > GFX10 && info->is_ngg)
       return false;
 
+   /* Xclipse 920: WGP mode breaks the SQIMG unit (image loads return zeros), so force CU mode. */
+   if (gfx_level == GFX10_3 && !info->is_ngg)
+      return false;
+
    if (stage == MESA_SHADER_FRAGMENT)
       return false;
 
@@ -1765,7 +1808,9 @@ radv_precompute_registers_hw_vs(struct radv_device *device, struct radv_shader *
       if (pdev->info.gfx_level >= GFX10) {
          const uint32_t oversub_pc_lines = late_alloc_wave64 ? pdev->info.pc_lines / 4 : 0;
 
-         regs->ge_pc_alloc = S_030980_OVERSUB_EN(oversub_pc_lines > 0) | S_030980_NUM_PC_LINES(oversub_pc_lines - 1);
+         /* Without oversubscription NUM_PC_LINES(0 - 1) would fill the field; write 0. */
+         regs->ge_pc_alloc = oversub_pc_lines ? S_030980_OVERSUB_EN(1) | S_030980_NUM_PC_LINES(oversub_pc_lines - 1)
+                                              : 0;
 
          /* Required programming for tessellation (legacy pipeline only). */
          if (shader->info.stage == MESA_SHADER_TESS_EVAL) {
@@ -1913,7 +1958,9 @@ radv_precompute_registers_hw_ngg(struct radv_device *device, struct radv_shader 
          oversub_pc_lines *= oversub_factor;
       }
 
-      regs->ge_pc_alloc = S_030980_OVERSUB_EN(oversub_pc_lines > 0) | S_030980_NUM_PC_LINES(oversub_pc_lines - 1);
+      /* Without oversubscription NUM_PC_LINES(0 - 1) would fill the field; write 0. */
+      regs->ge_pc_alloc =
+         oversub_pc_lines ? S_030980_OVERSUB_EN(1) | S_030980_NUM_PC_LINES(oversub_pc_lines - 1) : 0;
    }
 
    unsigned idx_format = V_028708_SPI_SHADER_1COMP;
@@ -1954,9 +2001,34 @@ radv_precompute_registers_hw_ngg(struct radv_device *device, struct radv_shader 
 
    regs->ngg.ge_ngg_subgrp_cntl =
       S_028B4C_PRIM_AMP_FACTOR(info->ngg_info.prim_amp_factor) | S_028B4C_THDS_PER_SUBGRP(0); /* for fast launch */
+   /* On the 530 a geometry shader renders nothing; every GS register offset matches the vendor but:
+    *
+    *     GE_NGG_SUBGRP_CNTL   vendor 0x00020004  PRIM_AMP_FACTOR=4  THDS_PER_SUBGRP=256
+    *                          ours   0x00000006  PRIM_AMP_FACTOR=6  THDS_PER_SUBGRP=0
+    *
+    * RADV_XCLIPSE_THDS=<n> forces THDS_PER_SUBGRP, RADV_XCLIPSE_PRIMAMP=<n> forces PRIM_AMP_FACTOR. */
+   {
+      const char *t = getenv("RADV_XCLIPSE_THDS");
+      const char *a = getenv("RADV_XCLIPSE_PRIMAMP");
+      if ((t && t[0]) || (a && a[0])) {
+         const unsigned thds = (t && t[0]) ? (unsigned)atoi(t)
+                                           : G_028B4C_THDS_PER_SUBGRP(regs->ngg.ge_ngg_subgrp_cntl);
+         const unsigned amp  = (a && a[0]) ? (unsigned)atoi(a) : info->ngg_info.prim_amp_factor;
+         regs->ngg.ge_ngg_subgrp_cntl =
+            S_028B4C_PRIM_AMP_FACTOR(amp) | S_028B4C_THDS_PER_SUBGRP(thds);
+      }
+   }
 
    regs->vgt_gs_instance_cnt = S_028B90_CNT(gs_num_invocations) | S_028B90_ENABLE(gs_num_invocations > 1) |
                                S_028B90_EN_MAX_VERT_OUT_PER_GS_INSTANCE(info->ngg_info.max_vert_out_per_gs_instance);
+
+   /* With a GS the 530 vendor writes 0x0000000d (ENABLE=1, CNT=3); we write 0x00000004, the vendor's
+    * non-GS value. RADV_XCLIPSE_GSICNT=<hex>. */
+   {
+      const char *e = getenv("RADV_XCLIPSE_GSICNT");
+      if (e && e[0])
+         regs->vgt_gs_instance_cnt = (uint32_t)strtoul(e, NULL, 0);
+   }
 
    if (pdev->info.gfx_level >= GFX11) {
       /* This should be <= 252 for performance on Gfx11. 256 works too but is slower. */
@@ -2764,6 +2836,43 @@ radv_shader_binary_get_layout(struct radv_shader_binary_legacy *binary)
    return layout;
 }
 
+/* Prepend the prologue PAL puts on every shader (captured on an A55):
+ *
+ *     b0802007   s_version 0x2007
+ *     bf840003   s_set_inst_prefetch_distance 0x3
+ *
+ * Both are GFX11-only opcodes. Possibly inert. The entry point becomes the prologue and falls
+ * through into the real code; the allocation grows to match.
+ *   RADV_XCLIPSE_SHADER_PROLOGUE / debug.radv_xclipse_shader_prologue = 1
+ */
+static const uint32_t radv_xclipse_prologue[] = {
+   0xb0802007, /* s_version 0x2007                 */
+   0xbf840003, /* s_set_inst_prefetch_distance 0x3 */
+};
+
+static unsigned
+radv_xclipse_prologue_size(const struct radv_physical_device *pdev)
+{
+   static int cached = -1;
+
+   if (!pdev->info.gfx11_shader_core)
+      return 0;
+
+   if (cached < 0) {
+      const char *e = getenv("RADV_XCLIPSE_SHADER_PROLOGUE");
+      cached = (e && e[0]) ? (atoi(e) != 0) : 0;
+#ifdef __ANDROID__
+      if (!cached) {
+         char v[PROP_VALUE_MAX] = {0};
+         if (__system_property_get("debug.radv_xclipse_shader_prologue", v) > 0 && v[0])
+            cached = atoi(v) != 0;
+      }
+#endif
+      RADV_LOGI("[XCLIPSE] shader prologue = %d", cached);
+   }
+   return cached ? sizeof(radv_xclipse_prologue) : 0;
+}
+
 static bool
 radv_shader_binary_upload(struct radv_device *device, const struct radv_shader_binary *binary,
                           struct radv_shader *shader, void *dest_ptr)
@@ -2811,7 +2920,29 @@ radv_shader_binary_upload(struct radv_device *device, const struct radv_shader_b
       struct radv_shader_binary_legacy *bin = (struct radv_shader_binary_legacy *)binary;
       struct radv_shader_binary_layout layout = radv_shader_binary_get_layout(bin);
 
-      memcpy(dest_ptr, layout.code, bin->code_size);
+      {
+         const struct radv_physical_device *ppd = radv_device_physical(device);
+         unsigned pro = radv_xclipse_prologue_size(ppd);
+
+         if (pro) {
+            memcpy(dest_ptr, radv_xclipse_prologue, pro);
+            memcpy((char *)dest_ptr + pro, layout.code, bin->code_size);
+            /* Read back what landed at the entry point. */
+            {
+               const uint32_t *rb = (const uint32_t *)dest_ptr;
+               RADV_LOGI("[XCLIPSE] prologue at entry: %08x %08x (want b0802007 bf840003)",
+                         rb[0], rb[1]);
+            }
+         } else {
+            memcpy(dest_ptr, layout.code, bin->code_size);
+         }
+      }
+
+      const uint8_t *code_bytes = (const uint8_t *)layout.code;
+      RADV_LOGI("[SHADER_UPLOAD] va=0x%llx code_size=%u first8=%02x%02x%02x%02x%02x%02x%02x%02x",
+                (unsigned long long)radv_shader_get_va(shader), bin->code_size,
+                code_bytes[0], code_bytes[1], code_bytes[2], code_bytes[3],
+                code_bytes[4], code_bytes[5], code_bytes[6], code_bytes[7]);
 
       if (shader->code) {
          memcpy(shader->code, layout.code, bin->code_size);
@@ -2830,7 +2961,8 @@ radv_shader_dma_resize_upload_buf(struct radv_device *device, struct radv_shader
 
    VkResult result = radv_bo_create(
       device, NULL, size, RADV_SHADER_ALLOC_ALIGNMENT, RADEON_DOMAIN_GTT,
-      RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_32BIT | RADEON_FLAG_GTT_WC,
+      RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_32BIT | RADEON_FLAG_GTT_WC |
+         RADEON_FLAG_XCLIPSE_CACHEABLE /* transient shader upload staging */,
       RADV_BO_PRIORITY_UPLOAD_BUFFER, 0, true, &submission->bo);
    if (result != VK_SUCCESS)
       return result;
@@ -3138,7 +3270,8 @@ radv_shader_create_uncached(struct radv_device *device, const struct radv_shader
 #endif
    } else {
       struct radv_shader_binary_legacy *bin = (struct radv_shader_binary_legacy *)binary;
-      shader->code_size = bin->code_size;
+      /* Room for the prologue. Zero unless the knob is on. */
+      shader->code_size = bin->code_size + radv_xclipse_prologue_size(radv_device_physical(device));
       shader->exec_size = bin->exec_size;
    }
 
@@ -3501,6 +3634,13 @@ radv_aco_fill_compiler_options(struct aco_compiler_options *aco_info, const stru
    aco_info->gfx_level = compiler_info->ac->gfx_level;
    aco_info->family = compiler_info->debug.family;
    aco_info->address32_hi = compiler_info->hw.address32_hi;
+
+   /* Only the ISA is GFX11: state and register emission stay at gfx_level, and RDNA3-only hardware
+    * features (dual-issue VALU) stay off. */
+   if (compiler_info->hw.gfx11_isa)
+      aco_info->gfx_level = GFX11;
+   aco_info->has_vopd = aco_info->gfx_level >= GFX11 && !compiler_info->hw.gfx11_isa;
+   aco_info->no_delay_alu = compiler_info->hw.gfx11_isa;
 }
 
 void

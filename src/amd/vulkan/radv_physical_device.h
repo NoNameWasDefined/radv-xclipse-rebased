@@ -138,14 +138,27 @@ struct radv_physical_device {
 
    /* Whether to emulate ETC2 image support on HW without support. */
    bool emulate_etc2;
+   /* The texture unit has no BC4/BC5/BC6H/BC7 decoder; decode them on the GPU at upload. */
+   bool emulate_bc;
+   /* Xclipse: DCC on colour targets; RADV_XCLIPSE_DCC=0 / debug.radv_xclipse_dcc 0 turns it off. */
+   bool xclipse_dcc;
 
    /* Whether to emulate ASTC image support on HW without support. */
    bool emulate_astc;
+
+   /* Xclipse: sample ASTC with the hardware decoder (codes: ac_xclipse_astc_img_format). Implies
+    * !emulate_astc. */
+   bool xclipse_native_astc;
+
+   /* Xclipse: same for ETC2/EAC (codes 123..132). Implies !emulate_etc2. */
+   bool xclipse_native_etc2;
 
    VkPhysicalDeviceMemoryProperties memory_properties;
    enum radeon_bo_domain memory_domains[VK_MAX_MEMORY_TYPES];
    enum radeon_bo_flag memory_flags[VK_MAX_MEMORY_TYPES];
    unsigned heaps;
+   /* Index of the synthesized PAL-parity heap, or -1. */
+   int xclipse_pal_heap_index;
 
    /* Bitmask of memory types that use the 32-bit address space. */
    uint32_t memory_types_32bit;

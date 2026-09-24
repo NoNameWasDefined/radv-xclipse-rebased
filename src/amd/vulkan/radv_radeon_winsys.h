@@ -53,6 +53,11 @@ enum radeon_bo_flag { /* bitfield */
                       RADEON_FLAG_VM_PAD_1PAGE = (1 << 14),
                       RADEON_FLAG_ENCRYPTED = (1 << 15),
                       RADEON_FLAG_EMULATE_SPARSE_RESIDENCY = (1 << 16),
+                      /* Xclipse: the amdgpu winsys may keep this BO bound for reuse instead of
+                       * freeing it (IB cache, radv_amdgpu_bo.c). Only for internal, plain linear
+                       * buffers (command, descriptor, upload); never images, app memory or
+                       * imports/exports. */
+                      RADEON_FLAG_XCLIPSE_CACHEABLE = (1 << 17),
 };
 
 enum radeon_ctx_priority {
@@ -170,6 +175,7 @@ struct radeon_winsys_bo {
    bool use_global_list;
    bool gfx12_allow_dcc;
    bool is_virtual; /* sparse buffers */
+   bool imported; /* came in via from_fd/from_ptr, not created here */
    enum radeon_bo_domain initial_domain;
    uint64_t obj_id;
 };

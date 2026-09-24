@@ -138,7 +138,12 @@ vk_image_init(struct vk_device *device,
    const VkFormat external_format =
       vk_android_get_external_format(pCreateInfo->pNext);
    if (external_format != VK_FORMAT_UNDEFINED) {
-      assert(image->format == VK_FORMAT_UNDEFINED);
+      /* The spec requires VkImageCreateInfo::format be UNDEFINED when an external format is
+       * supplied, but RADV reports externalFormat == the buffer's VkFormat (radv_android.c), so
+       * apps that forward that value while also setting the real format (Winlator's AHB present
+       * path does) are self-consistent, so vk_image_set_format below is then idempotent. Tolerate
+       * that redundant case; still catch a genuinely conflicting format/externalFormat pair. */
+      assert(image->format == VK_FORMAT_UNDEFINED || image->format == external_format);
       assert(image->external_handle_types &
              VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID);
       vk_image_set_format(image, external_format);

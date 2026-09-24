@@ -51,8 +51,12 @@ radv_create_event(struct radv_device *device, const VkEventCreateInfo *pCreateIn
       bo_flags = RADEON_FLAG_CPU_ACCESS;
    }
 
+   /* PREFER_LOCAL -> VM_ALWAYS_VALID on the GTT path: this 8-byte fence BO churns at startup, each
+    * a first GART bind. Not shared; the invisible-VRAM path is left alone. */
+   const enum radeon_bo_flag av_flag =
+      (bo_domain == RADEON_DOMAIN_GTT) ? RADEON_FLAG_PREFER_LOCAL_BO : 0;
    result = radv_bo_create(device, &event->base, 8, 8, bo_domain,
-                           RADEON_FLAG_GL2_BYPASS | RADEON_FLAG_NO_INTERPROCESS_SHARING | bo_flags,
+                           RADEON_FLAG_GL2_BYPASS | RADEON_FLAG_NO_INTERPROCESS_SHARING | bo_flags | av_flag,
                            RADV_BO_PRIORITY_FENCE, 0, is_internal, &event->bo);
    if (result != VK_SUCCESS) {
       radv_destroy_event(device, pAllocator, event);

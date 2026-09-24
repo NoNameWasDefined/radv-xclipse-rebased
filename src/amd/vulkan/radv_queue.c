@@ -9,6 +9,7 @@
  */
 
 #include "radv_queue.h"
+#include "radv_cpushare.h"
 #include "tools/radv_debug_hang.h"
 #include "tools/radv_debug_nir.h"
 #include "tools/radv_rmv.h"
@@ -24,6 +25,15 @@
 #include "ac_cmdbuf.h"
 #include "ac_debug.h"
 #include "ac_descriptors.h"
+#include "amdgfxregs.h"
+#include "radv_logcat.h"
+#include "ac_xclipse_ctxinit.h"
+#include "util/os_time.h"
+#include "util/u_xclipse_prof.h"
+
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 
 enum radeon_ctx_priority
 radv_get_queue_global_priority(const VkDeviceQueueGlobalPriorityCreateInfo *pObj)
@@ -249,7 +259,7 @@ radv_set_ring_buffer(const struct radv_physical_device *pdev, struct radeon_wins
       .has_desc_resource_level = pdev->info.compiler_info.has_desc_resource_level,
    };
 
-   ac_build_buffer_descriptor(pdev->info.gfx_level, &ac_state, desc);
+   ac_build_buffer_descriptor(pdev->info.desc_gfx_level, &ac_state, desc);
 }
 
 static void
@@ -334,7 +344,7 @@ radv_fill_shader_rings(struct radv_device *device, uint32_t *desc, struct radeon
    if (ge_rings_bo) {
       assert(pdev->info.gfx_level >= GFX11);
 
-      ac_build_attr_ring_descriptor(pdev->info.gfx_level, pdev->info.compiler_info.has_desc_resource_level,
+      ac_build_attr_ring_descriptor(pdev->info.desc_gfx_level, pdev->info.compiler_info.has_desc_resource_level,
                                     radv_buffer_get_va(ge_rings_bo), pdev->info.total_attribute_pos_prim_ring_size, 0,
                                     &desc[0]);
    }
@@ -626,6 +636,76 @@ radv_emit_ge_rings(struct radv_device *device, struct radv_cmd_stream *cs, struc
    ac_emit_cp_gfx11_ge_rings(cs->b, &pdev->info, va, pdev->gfx12_hiz_wa == RADV_GFX12_HIZ_WA_PARTIAL);
 }
 
+/* Context init for the Xclipse 530, which never gets a clear state: sgpu skips the RLC clear-state
+ * buffer for AMDGPU_FAMILY_MGFX, so PKT3_CLEAR_STATE is a no-op there and 535 context registers
+ * would stay unwritten. The table is the vendor's init programming observed at runtime (not the
+ * GPL kernel clearstate). Emitted first, so everything else overrides it.
+ *   RADV_XCLIPSE_CTXINIT / debug.radv_xclipse_ctxinit:
+ *     0 = off, CLEAR_STATE allowed   1 = on, no CLEAR_STATE (530 default)
+ *     2 = off, still no CLEAR_STATE
+ *   Returns the raw mode, not a bool. */
+static int
+radv_xclipse_ctxinit_mode(const struct radv_physical_device *pdev)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      int want = -1;
+      const char *e = getenv("RADV_XCLIPSE_CTXINIT");
+      if (e && e[0])
+         want = atoi(e);
+#ifdef __ANDROID__
+      if (want < 0) {
+         char v[PROP_VALUE_MAX] = {0};
+         if (__system_property_get("debug.radv_xclipse_ctxinit", v) > 0 && v[0])
+            want = atoi(v);
+      }
+#endif
+      cached = want >= 0 ? want : (pdev->info.xclipse_model == AC_XCLIPSE_530 ? 1 : 0);
+      RADV_LOGI("[XCLIPSE] ctx_init=%d (model=%d, %u regs)", cached,
+                pdev->info.xclipse_model, (unsigned)ARRAY_SIZE(ac_xclipse_ctx_init));
+   }
+   return cached;
+}
+
+static bool
+radv_xclipse_needs_ctx_init(const struct radv_physical_device *pdev)
+{
+   return radv_xclipse_ctxinit_mode(pdev) == 1;
+}
+
+/* Whether a CLEAR_STATE packet may be sent (separate from the context init):
+ *   0  no context init, CLEAR_STATE allowed      (upstream; unstable on the 530)
+ *   1  context init every submit, no CLEAR_STATE (530 default)
+ *   2  no context init, no CLEAR_STATE
+ */
+static bool
+radv_xclipse_allows_clear_state(const struct radv_physical_device *pdev)
+{
+   return !radv_xclipse_ctxinit_mode(pdev);
+}
+
+/* CB/DB GL2 cache policy. Default: STREAM writes + NOA reads (kernel clearstate). The 530 has one
+ * L2 slice (the 920 has four), where no-allocate may behave differently.
+ *   RADV_XCLIPSE_CBGL2 / debug.radv_xclipse_cbgl2 = 1 -> cache CB and DB in GL2 (LRU). */
+static bool
+radv_xclipse_cb_gl2(void)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      const char *e = getenv("RADV_XCLIPSE_CBGL2");
+      cached = (e && e[0]) ? (atoi(e) != 0) : 0;
+#ifdef __ANDROID__
+      if (!e || !e[0]) {
+         char v[PROP_VALUE_MAX] = {0};
+         if (__system_property_get("debug.radv_xclipse_cbgl2", v) > 0 && v[0])
+            cached = atoi(v) != 0;
+      }
+#endif
+      RADV_LOGI("[XCLIPSE] cache_cb_gl2=%d", cached);
+   }
+   return cached == 1;
+}
+
 static void
 radv_emit_compute(struct radv_device *device, struct radv_cmd_stream *cs, bool is_compute_queue)
 {
@@ -644,6 +724,8 @@ radv_emit_compute(struct radv_device *device, struct radv_cmd_stream *cs, bool i
          },
    };
 
+   RADV_LOGI("[QUEUE] Emitting COMPUTE preamble border_color_va=0x%llx is_compute_queue=%d",
+             (unsigned long long)border_color_va, is_compute_queue);
    ac_init_compute_preamble_state(&preamble_state, pm4);
 
    ac_pm4_set_reg(pm4, R_00B810_COMPUTE_START_X, 0);
@@ -691,9 +773,15 @@ radv_emit_graphics(struct radv_device *device, struct radv_cmd_stream *cs)
    struct radv_physical_device *pdev = radv_device_physical(device);
    const uint64_t border_color_va = device->border_color_data.bo ? radv_buffer_get_va(device->border_color_data.bo) : 0;
    bool has_clear_state = pdev->info.has_clear_state;
+
+   /* No CLEAR_STATE with the context init: the RLC clear-state buffer was never built. */
+   if (!radv_xclipse_allows_clear_state(pdev))
+      has_clear_state = false;
    int i;
 
-   struct ac_pm4_state *pm4 = ac_pm4_create_sized(&pdev->info, false, 512, false);
+   /* 512 dwords covers the stock preamble; the context init adds ~535 registers plus headers. */
+   struct ac_pm4_state *pm4 =
+      ac_pm4_create_sized(&pdev->info, false, radv_xclipse_needs_ctx_init(pdev) ? 2048 : 512, false);
    if (!pm4)
       return;
 
@@ -708,10 +796,25 @@ radv_emit_graphics(struct radv_device *device, struct radv_cmd_stream *cs)
       }
    }
 
+   if (radv_xclipse_needs_ctx_init(pdev)) {
+      /* Ascending order: ac_pm4_set_reg coalesces consecutive registers. */
+      for (unsigned ci = 0; ci < ARRAY_SIZE(ac_xclipse_ctx_init); ci++)
+         ac_pm4_set_reg(pm4, ac_xclipse_ctx_init[ci].reg, ac_xclipse_ctx_init[ci].val);
+   }
+
    const struct ac_preamble_state preamble_state = {
       .border_color_va = border_color_va,
+      .gfx10 =
+         {
+            /* Xclipse: the kernel clearstate policy (STREAM writes, NOA reads) unless
+             * RADV_XCLIPSE_CBGL2 asks for LRU. */
+            .cache_cb_gl2 = radv_xclipse_cb_gl2(),
+            .cache_db_gl2 = radv_xclipse_cb_gl2(),
+         },
    };
 
+   RADV_LOGI("[QUEUE] Emitting GRAPHICS preamble border_color_va=0x%llx has_clear_state=%d",
+             (unsigned long long)border_color_va, has_clear_state);
    ac_init_graphics_preamble_state(&preamble_state, pm4);
 
    if (!has_clear_state) {
@@ -821,6 +924,17 @@ radv_emit_graphics(struct radv_device *device, struct radv_cmd_stream *cs)
       /* Disable SINGLE clear codes on GFX11 (including first GFX11.5 rev) to workaround a hw bug
        * with DCC. */
       ac_pm4_set_reg(pm4, R_028424_CB_FDCC_CONTROL, S_028424_DISABLE_CONSTANT_ENCODE_SINGLE(1));
+   }
+
+   /* Xclipse IFPO guard: the sgpu kernel's inter-frame power-off can wedge the CPU in
+    * __vangogh_lite_ifpo_power_on (busy-wait, no timeout) until the watchdog resets the phone. It
+    * refuses to power off while CP_PERFMON_CNTL bits [7:0] are nonzero, so keep the perfmon block
+    * in STOP_COUNTING. The preamble re-arms it every submit. May distort
+    * VK_KHR_performance_query across submits. */
+   if (pdev->info.gfx11_shader_core) {
+      ac_pm4_set_reg(pm4, R_036020_CP_PERFMON_CNTL,
+                     S_036020_PERFMON_STATE(V_036020_CP_PERFMON_STATE_STOP_COUNTING));
+      RADV_LOGI("[QUEUE] IFPO guard armed (CP_PERFMON_CNTL=STOP_COUNTING blocks inter-frame power off)");
    }
 
    ac_pm4_finalize(pm4);
@@ -946,8 +1060,12 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
 
    if (!queue->ring_info.ge_rings && needs->ge_rings) {
       assert(pdev->info.gfx_level >= GFX11);
+      /* This APU has no VRAM (vram_size = 0), so RADEON_DOMAIN_VRAM fails: ask the winsys which
+       * domain backs memory. */
       result = radv_bo_create(device, NULL, pdev->info.total_attribute_pos_prim_ring_size, 2 * 1024 * 1024 /* 2MiB */,
-                              RADEON_DOMAIN_VRAM, RADEON_FLAG_32BIT | RADEON_FLAG_DISCARDABLE | ring_bo_flags_tmz,
+                              /* Not cs_domain(): has_dedicated_vram is forced true here. */
+                              pdev->info.vram_size_kb ? RADEON_DOMAIN_VRAM : RADEON_DOMAIN_GTT,
+                              RADEON_FLAG_32BIT | RADEON_FLAG_DISCARDABLE | ring_bo_flags_tmz,
                               RADV_BO_PRIORITY_SCRATCH, 0, true, &ge_rings_bo);
       if (result != VK_SUCCESS)
          goto fail;
@@ -1860,6 +1978,21 @@ radv_queue_handle_fault_state(struct radv_queue *queue)
    radv_report_gpuvm_fault(device);
 }
 
+static VkResult radv_queue_submit_timed(struct vk_queue *vqueue, struct vk_queue_submit *submission);
+
+/* [CPUSHARE] wrapper, so every exit of radv_queue_submit_timed is timed. */
+static VkResult
+radv_queue_submit(struct vk_queue *vqueue, struct vk_queue_submit *submission)
+{
+   RADV_CPU_T0();
+   const int64_t xprof_t0 = u_xclipse_prof_active() ? os_time_get_nano() : 0;
+   const VkResult r = radv_queue_submit_timed(vqueue, submission);
+   if (xprof_t0)
+      u_xclipse_prof_wait(U_XCLIPSE_WAIT_SUBMIT, os_time_get_nano() - xprof_t0);
+   RADV_CPU_T1(RADV_CPU_SUBMIT);
+   return r;
+}
+
 static VkResult
 radv_queue_sparse_submit(struct vk_queue *vqueue, struct vk_queue_submit *submission)
 {
@@ -1901,7 +2034,7 @@ fail:
 }
 
 static VkResult
-radv_queue_submit(struct vk_queue *vqueue, struct vk_queue_submit *submission)
+radv_queue_submit_timed(struct vk_queue *vqueue, struct vk_queue_submit *submission)
 {
    struct radv_queue *queue = (struct radv_queue *)vqueue;
    struct radv_device *device = radv_queue_device(queue);

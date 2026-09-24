@@ -329,6 +329,16 @@ struct radv_cmd_state {
    enum ac_barrier_flags flush_bits;
    /* Earliest PWS acquire point required by the currently pending flush_bits*/
    enum ac_pws_acquire_point pws_acquire_point;
+
+   /* BCn decode: defer the post-decode cache flush across copy commands (each copy has one region,
+    * so per-command batching gains nothing).
+    * `bc_decode_pending`: a decode ran that nothing has been ordered against yet.
+    * `bc_decode_active`: set while a decode emits its own dispatch, so it doesn't drain its own flag.
+    * radv_emit_cache_flush() converts the flag to flush bits; every drain path goes through it. */
+   bool bc_decode_pending;
+   /* Nesting depth, not a bool: the copy command and its decode dispatch both open the window. */
+   unsigned bc_decode_active;
+
    unsigned active_occlusion_queries;
    bool perfect_occlusion_queries_enabled;
    unsigned active_pipeline_queries;
@@ -574,6 +584,13 @@ struct radv_cmd_buffer {
    struct util_dynarray ray_history;
 
    struct list_head msrtss_transients;
+
+   /* Xclipse field profiler (radv_xclipse_prof.c), 0 when not sampling: timestamp slot + 1 of this
+    * command buffer's busy span, and pass slot + 1 of the pass being recorded. */
+   uint32_t xprof_slot;
+   uint32_t xprof_pass;
+   uint32_t xprof_draws;
+   const struct radv_shader *xprof_ps;
 };
 
 struct radv_msrtss_transient {
