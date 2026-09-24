@@ -1042,7 +1042,9 @@ schedule_ilp(Program* program)
 void
 schedule_vopd(Program* program)
 {
-   if (program->gfx_level < GFX11 || program->wave_size != 32)
+   /* Gated on the hardware feature, not the ISA: Xclipse 920 emits GFX11 encodings on an
+    * RDNA2 core, which has no dual-issue VALU. */
+   if (!program->dev.has_vopd || program->wave_size != 32)
       return;
 
    SchedILPContext ctx = {program};

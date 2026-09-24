@@ -85,7 +85,12 @@ get_type(Program* program, aco_ptr<Instruction>& instr)
          return clause_other;
 
       if (instr->isVMEM() && !instr->operands.empty()) {
-         if (program->gfx_level == GFX10 && instr->isMIMG() && get_mimg_nsa_dwords(instr.get()) > 0)
+         /* NSA MIMG cannot be in hard clauses on GFX10/GFX10.3 due to hardware errata.
+          * Samsung's driver has NSA_CANNOT_BE_LAST_IN_CLAUSE (bug 6037) and
+          * NSA_AND_CLAUSE_CAN_HANG (bug 8448) workarounds for this.
+          */
+         if (program->gfx_level <= GFX10_3 && instr->isMIMG() &&
+             get_mimg_nsa_dwords(instr.get()) > 0)
             return clause_other;
          else
             return clause_vmem;

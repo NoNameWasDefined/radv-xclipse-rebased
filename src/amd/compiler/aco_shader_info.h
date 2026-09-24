@@ -158,7 +158,13 @@ struct aco_compiler_options {
    bool wgp_mode;
    bool is_opengl;
    enum radeon_family family;
+   /* The ISA to emit. On Xclipse 920 this is GFX11 while the hardware is RDNA2, so it does not by
+    * itself imply any RDNA3 hardware capability; those get their own flags below. */
    enum amd_gfx_level gfx_level;
+   /* Dual-issue VALU (v_dual_*): RDNA3 hardware only; an RDNA2 core decoding GFX11 faults on it. */
+   bool has_vopd;
+   /* Do not emit s_delay_alu: an RDNA3 hardware feature. The vendor compiler emits none here. */
+   bool no_delay_alu;
    uint32_t address32_hi;
 };
 

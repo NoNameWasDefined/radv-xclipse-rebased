@@ -612,9 +612,10 @@ kill(wait_imm& imm, depctr_wait& depctr, Instruction* instr, wait_ctx& ctx,
 
    check_instr(ctx, imm, instr);
 
-   /* Only inserted by this pass, and outside loops. */
-   assert(ctx.gfx_level < GFX11 || instr->opcode != aco_opcode::s_sendmsg ||
-          instr->salu().imm != sendmsg_dealloc_vgprs);
+   /* Only inserted by this pass, and outside loops. On the GFX10.3-message-bus hybrid, imm 3 is
+    * GS_DONE from the legacy-GS lowering, not dealloc_vgprs. */
+   assert(ctx.gfx_level < GFX11 || ctx.program->gfx10_sendmsg ||
+          instr->opcode != aco_opcode::s_sendmsg || instr->salu().imm != sendmsg_dealloc_vgprs);
 
    if (instr->opcode == aco_opcode::ds_ordered_count &&
        ((instr->ds().offset1 | (instr->ds().offset0 >> 8)) & 0x1)) {
@@ -943,6 +944,11 @@ void
 deallocate_vgprs(wait_ctx& ctx, std::vector<aco_ptr<Instruction>>& instructions)
 {
    if (ctx.gfx_level < GFX11)
+      return;
+
+   /* Xclipse 920: the message bus is GFX10.3, where imm 3 means GS_DONE: sending it from an
+    * arbitrary wave is wrong, and there is no VGPR-dealloc feature to invoke anyway. */
+   if (ctx.program->gfx10_sendmsg)
       return;
 
    /* New waves are likely not vgpr limited. */

@@ -996,7 +996,7 @@ emit_exp_instruction(asm_context& ctx, std::vector<uint32_t>& out, const Instruc
       encoding = (0b111110 << 26);
    }
 
-   if (ctx.gfx_level >= GFX11) {
+   if (ctx.gfx_level >= GFX11 && !ctx.program->gfx10_export_encoding) {
       encoding |= exp.row_en ? 0b1 << 13 : 0;
    } else {
       encoding |= exp.valid_mask ? 0b1 << 12 : 0;

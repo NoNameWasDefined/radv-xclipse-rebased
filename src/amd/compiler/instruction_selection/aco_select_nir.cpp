@@ -11,6 +11,7 @@
 #include "aco_nir_call_attribs.h"
 
 #include "amdgfxregs.h"
+#include "ac_shader_util.h"
 #include <array>
 #include <utility>
 #include <vector>
@@ -448,13 +449,21 @@ visit_tex(isel_context* ctx, nir_tex_instr* instr)
                             instr->sampler_dim == GLSL_SAMPLER_DIM_SUBPASS_MS
                          ? aco_opcode::image_load
                          : aco_opcode::image_load_mip;
+      /* Xclipse 920 (GFX10_4): the FMASK fetch uses the colour T# with the msaa dim, which needs one
+       * extra sample coordinate (ignored by the TA; we pass zero). */
+      if (instr->op == nir_texop_fragment_mask_fetch_amd && ctx->program->gfx10_4_fmask)
+         args.push_back(bld.copy(bld.def(v1), Operand::zero()));
       Operand vdata = instr->is_sparse ? emit_tfe_init(bld, tmp_dst) : Operand(v1);
       MIMG_instruction* tex =
          emit_mimg(bld, op, {tmp_dst}, resource, Operand(s4), args, disable_wqm, vdata);
-      if (instr->op == nir_texop_fragment_mask_fetch_amd)
-         tex->dim = da ? ac_image_2darray : ac_image_2d;
-      else
+      if (instr->op == nir_texop_fragment_mask_fetch_amd) {
+         if (ctx->program->gfx10_4_fmask)
+            tex->dim = da ? ac_image_2darraymsaa : ac_image_2dmsaa;
+         else
+            tex->dim = da ? ac_image_2darray : ac_image_2d;
+      } else {
          tex->dim = dim;
+      }
       tex->dmask = dmask & 0xf;
       tex->unrm = true;
       tex->da = da;
