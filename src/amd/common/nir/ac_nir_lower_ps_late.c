@@ -209,17 +209,19 @@ emit_ps_mrtz_export(nir_builder *b, lower_ps_state *s, nir_def *mrtz_alpha)
    if (format == V_028710_SPI_SHADER_UINT16_ABGR) {
       assert(!s->depth && !mrtz_alpha);
 
-      if (s->options->gfx_level < GFX11)
+      const bool gfx11_exp = s->options->gfx_level >= GFX11 || s->options->gfx11_export_conventions;
+
+      if (!gfx11_exp)
          flags |= AC_EXP_FLAG_COMPRESSED;
 
       if (s->stencil) {
          outputs[0] = nir_ishl_imm(b, s->stencil, 16);
-         enabled_channels |= s->options->gfx_level >= GFX11 ? 0x1 : 0x3;
+         enabled_channels |= gfx11_exp ? 0x1 : 0x3;
       }
 
       if (s->sample_mask) {
          outputs[1] = s->sample_mask;
-         enabled_channels |= s->options->gfx_level >= GFX11 ? 0x2 : 0xc;
+         enabled_channels |= gfx11_exp ? 0x2 : 0xc;
       }
    } else {
       if (s->depth) {
@@ -498,13 +500,13 @@ emit_ps_color_export(nir_builder *b, lower_ps_state *s, unsigned output_index, u
             }
          }
 
-         if (s->options->gfx_level >= GFX11)
+         if (s->options->gfx_level >= GFX11 || s->options->gfx11_export_conventions)
             enabled_channels |= BITFIELD_BIT(i);
          else
             enabled_channels |= 0x3 << (i * 2);
       }
 
-      if (s->options->gfx_level < GFX11)
+      if (s->options->gfx_level < GFX11 && !s->options->gfx11_export_conventions)
          flags |= AC_EXP_FLAG_COMPRESSED;
    }
    }

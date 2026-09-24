@@ -47,6 +47,24 @@ bool radv_nir_optimize_vs_inputs_to_const(nir_shader *shader, const struct radv_
 
 bool radv_nir_lower_primitive_shading_rate(nir_shader *nir, enum amd_gfx_level gfx_level);
 
+/* VK_NV_viewport_swizzle. `swizzles` holds VkViewportCoordinateSwizzleNV values, 4 per viewport.
+ * `incomplete` is set when a position store had to fall back to viewport 0's swizzle.
+ */
+bool radv_nir_lower_viewport_swizzle(nir_shader *nir, const uint8_t (*swizzles)[4], unsigned count,
+                                     bool *incomplete);
+
+bool radv_nir_viewport_swizzle_is_identity(const uint8_t (*swizzles)[4], unsigned count);
+
+/* VK_NV_viewport_array2: lower gl_ViewportMask[] to gl_ViewportIndex. Exact for single-bit masks
+ * (the Maxwell-native case); sets *multi_bit when a provably multi-bit constant mask was lowered
+ * approximately, because real broadcast needs primitive amplification we do not implement. */
+bool radv_nir_lower_viewport_mask(nir_shader *nir, bool *multi_bit);
+
+/* VK_NV_geometry_shader_passthrough: no AMD hardware has a passthrough geometry stage, so rebuild
+ * the equivalent ordinary GS (copy each passthrough input to its output per vertex, then
+ * EmitVertex/EndPrimitive). Adjacency primitives emit only the non-adjacent vertices. */
+bool radv_nir_lower_passthrough_gs(nir_shader *nir);
+
 bool radv_nir_lower_fs_intrinsics(nir_shader *nir, const struct radv_shader_stage *fs_stage,
                                   const struct radv_graphics_state_key *gfx_state);
 

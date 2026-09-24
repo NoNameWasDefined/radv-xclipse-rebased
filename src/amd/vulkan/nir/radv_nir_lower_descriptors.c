@@ -16,6 +16,7 @@
 
 typedef struct {
    enum amd_gfx_level gfx_level;
+   enum amd_gfx_level desc_gfx_level;
    uint32_t address32_hi;
    uint32_t sampled_image_desc_size;
    uint32_t combined_image_sampler_desc_size;
@@ -179,7 +180,7 @@ load_inline_buffer_descriptor(nir_builder *b, lower_descriptors_state *state, ni
 {
    uint32_t desc[4];
 
-   ac_build_raw_buffer_descriptor(state->gfx_level, state->has_desc_resource_level, (uint64_t)state->address32_hi << 32,
+   ac_build_raw_buffer_descriptor(state->desc_gfx_level, state->has_desc_resource_level, (uint64_t)state->address32_hi << 32,
                                   0xffffffff, desc);
 
    return nir_vec4(b, rsrc, nir_imm_int(b, desc[1]), nir_imm_int(b, desc[2]), nir_imm_int(b, desc[3]));
@@ -290,7 +291,10 @@ get_sampler_desc(nir_builder *b, lower_descriptors_state *state, nir_deref_instr
    case AC_DESC_PLANE_0:
       break;
    case AC_DESC_FMASK:
-      offset += 32;
+      /* Xclipse 920 (desc_gfx_level != gfx_level): no separate FMASK T#; the fragment-mask fetch
+       * uses the colour descriptor (image_load dmask:1 dim:2D_MSAA). */
+      if (state->desc_gfx_level == state->gfx_level)
+         offset += 32;
       break;
    case AC_DESC_PLANE_1:
       offset += plane_offset;
@@ -707,6 +711,7 @@ radv_nir_lower_descriptors(nir_shader *shader, const struct radv_compiler_info *
 
    lower_descriptors_state state = {
       .gfx_level = compiler_info->ac->gfx_level,
+      .desc_gfx_level = compiler_info->ac->desc_gfx_level,
       .address32_hi = compiler_info->hw.address32_hi,
       .sampled_image_desc_size = compiler_info->sampled_image_desc_size,
       .combined_image_sampler_desc_size = compiler_info->combined_image_sampler_desc_size,
