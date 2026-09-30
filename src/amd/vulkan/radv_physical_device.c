@@ -3102,7 +3102,10 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
     * RADV_XCLIPSE_NO_BC_EMU=1 or setprop debug.radv_xclipse_no_bc_emu 1. */
    pdev->emulate_bc =
       pdev->info.gfx11_shader_core && !radv_xclipse_flag("RADV_XCLIPSE_NO_BC_EMU", "radv_xclipse_no_bc_emu");
+   pdev->xclipse_bc5_alias = pdev->emulate_bc && radv_xclipse_flag("RADV_XCLIPSE_BC5_ALIAS", "radv_xclipse_bc5_alias");
    pdev->xclipse_dcc = pdev->info.gfx11_shader_core && !radv_xclipse_flag_off("RADV_XCLIPSE_DCC", "radv_xclipse_dcc");
+   pdev->xclipse_dcc_small =
+      pdev->xclipse_dcc && !radv_xclipse_flag_off("RADV_XCLIPSE_DCC_SMALL", "radv_xclipse_dcc_small");
    /* The texture unit decodes ASTC and ETC2/EAC in hardware (codes measured, see
     * ac_xclipse_astc_img_format() and ac_xclipse_etc2_img_format()), so neither is emulated. */
    pdev->xclipse_native_astc = pdev->info.gfx11_shader_core;
@@ -3116,6 +3119,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
    /* BC4-BC7 GPU decode, see above. */
    pdev->emulate_bc =
       pdev->info.gfx11_shader_core && !radv_xclipse_flag("RADV_XCLIPSE_NO_BC_EMU", "radv_xclipse_no_bc_emu");
+   pdev->xclipse_bc5_alias = pdev->emulate_bc && radv_xclipse_flag("RADV_XCLIPSE_BC5_ALIAS", "radv_xclipse_bc5_alias");
 #endif
 
    const char *name = ac_get_gpu_display_name(&pdev->info);

@@ -1507,6 +1507,8 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
    device->vk.check_status = radv_device_check_status;
 
    device->vk.command_buffer_ops = &radv_cmd_buffer_ops;
+   /* Samsung sgpu cannot take a foreign sync_file as a submit dependency (see vk_drm_syncobj.c). */
+   device->vk.sync_file_import_cpu_wait = true;
 
    result = radv_device_init_utrace(device);
    if (result != VK_SUCCESS)
