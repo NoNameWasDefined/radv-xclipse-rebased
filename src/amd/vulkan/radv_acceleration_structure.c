@@ -5,6 +5,9 @@
  */
 
 #include "meta/radv_meta.h"
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 #include "radv_buffer.h"
 #include "radv_entrypoints.h"
 #include "radv_tracepoints.h"
@@ -1060,6 +1063,27 @@ pack_geometry_id_and_flags(uint32_t geometry_id, uint32_t flags)
    return geometry_id_and_flags;
 }
 
+/* Xclipse (gfx11_shader_core): wave64 lanes cannot read the other 32-lane half. ACO does that with
+ * v_permlane64_b32, which only RDNA3 has, and on the 920 the value reads back 0 (sgprobe 64). The
+ * BVH builder shuffles across lanes (H-PLOC merges, radix sort scatter), so on this chip it is
+ * built at wave32, which RDNA2 hardware runs natively. */
+/* debug.radv_xclipse_bvh_w64 1 (or RADV_XCLIPSE_BVH_W64=1) builds at wave64 again, for A/B. */
+static bool
+radv_xclipse_bvh_wave32(const struct radv_physical_device *pdev)
+{
+   if (!pdev->info.gfx11_shader_core)
+      return false;
+   const char *e = getenv("RADV_XCLIPSE_BVH_W64");
+   if (e && e[0])
+      return atoi(e) == 0;
+#ifdef __ANDROID__
+   char v[PROP_VALUE_MAX] = {0};
+   if (__system_property_get("debug.radv_xclipse_bvh_w64", v) > 0 && v[0])
+      return atoi(v) == 0;
+#endif
+   return true;
+}
+
 static void
 radv_write_buffer_cp(VkCommandBuffer commandBuffer, VkDeviceAddress addr, void *data, uint32_t size)
 {
@@ -1170,6 +1194,7 @@ void
 radv_device_init_accel_struct_build_state(struct radv_device *device)
 {
    const struct radv_physical_device *pdev = radv_device_physical(device);
+   const bool bvh_w32 = radv_xclipse_bvh_wave32(pdev);
 
    device->meta_state.accel_struct_build.build_ops = (struct vk_acceleration_structure_build_ops){
       .begin_debug_marker = radv_accel_struct_cmd_begin_debug_marker,
@@ -1194,7 +1219,7 @@ radv_device_init_accel_struct_build_state(struct radv_device *device)
    device->vk.cmd_fill_buffer_addr = radv_cmd_fill_buffer_addr;
 
    struct vk_acceleration_structure_build_args *build_args = &device->meta_state.accel_struct_build.build_args;
-   build_args->subgroup_size = 64;
+   build_args->subgroup_size = bvh_w32 ? 32 : 64;
    build_args->bvh_bounds_offset = offsetof(struct radv_accel_struct_header, aabb);
    build_args->root_flags_offset = offsetof(struct radv_accel_struct_header, root_flags);
    build_args->propagate_cull_flags = pdev->info.gfx_level >= GFX11;
