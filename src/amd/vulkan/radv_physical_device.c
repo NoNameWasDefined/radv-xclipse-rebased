@@ -3104,6 +3104,8 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
       pdev->info.gfx11_shader_core && !radv_xclipse_flag("RADV_XCLIPSE_NO_BC_EMU", "radv_xclipse_no_bc_emu");
    pdev->xclipse_bc5_alias =
       pdev->emulate_bc && !radv_xclipse_flag_off("RADV_XCLIPSE_BC5_ALIAS", "radv_xclipse_bc5_alias");
+   pdev->xclipse_bc7_alias =
+      pdev->emulate_bc && !radv_xclipse_flag_off("RADV_XCLIPSE_BC7_ALIAS", "radv_xclipse_bc7_alias");
    pdev->xclipse_dcc = pdev->info.gfx11_shader_core && !radv_xclipse_flag_off("RADV_XCLIPSE_DCC", "radv_xclipse_dcc");
    pdev->xclipse_dcc_small =
       pdev->xclipse_dcc && !radv_xclipse_flag_off("RADV_XCLIPSE_DCC_SMALL", "radv_xclipse_dcc_small");
@@ -3122,6 +3124,8 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
       pdev->info.gfx11_shader_core && !radv_xclipse_flag("RADV_XCLIPSE_NO_BC_EMU", "radv_xclipse_no_bc_emu");
    pdev->xclipse_bc5_alias =
       pdev->emulate_bc && !radv_xclipse_flag_off("RADV_XCLIPSE_BC5_ALIAS", "radv_xclipse_bc5_alias");
+   pdev->xclipse_bc7_alias =
+      pdev->emulate_bc && !radv_xclipse_flag_off("RADV_XCLIPSE_BC7_ALIAS", "radv_xclipse_bc7_alias");
 #endif
 
    const char *name = ac_get_gpu_display_name(&pdev->info);
