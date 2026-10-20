@@ -1534,7 +1534,7 @@ radv_try_fill_clear_color(struct radv_cmd_buffer *cmd_buffer, const struct radv_
       return false;
    if (radv_image_has_dcc(image) || radv_image_has_cmask(image) || radv_image_has_fmask(image))
       return false;
-   if (!radv_is_clear_rect_full(iview, clear_rect, view_mask))
+   if (!radv_is_clear_rect_full(iview, clear_rect, view_mask, true))
       return false;
    if (vk_format_get_blocksizebits(iview->vk.format) != vk_format_get_blocksizebits(image->vk.format))
       return false;
